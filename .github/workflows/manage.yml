@@ -1,0 +1,123 @@
+name: Manage Subscriptions And Query
+
+concurrency:
+  group: x2ding-main-write
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: '执行动作: subscribe_add / subscribe_remove / subscribe_set / subscribe_list / query'
+        required: true
+        default: 'query'
+      targets:
+        description: '订阅目标，支持逗号或换行。示例: elonmusk,OpenAI,search:AI safety'
+        required: false
+      keyword:
+        description: '查询关键字'
+        required: false
+      target:
+        description: '查询时按具体订阅目标过滤'
+        required: false
+      since:
+        description: '查询起始时间，ISO 8601'
+        required: false
+      until:
+        description: '查询结束时间，ISO 8601'
+        required: false
+      limit:
+        description: '查询结果条数'
+        required: false
+        default: '20'
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run requested action
+      shell: bash
+      run: |
+        mkdir -p data/query_results
+        case "${{ inputs.action }}" in
+          subscribe_add)
+            python twitter_monitor.py subscribe add --targets "${{ inputs.targets }}"
+            ;;
+          subscribe_remove)
+            python twitter_monitor.py subscribe remove --targets "${{ inputs.targets }}"
+            ;;
+          subscribe_set)
+            python twitter_monitor.py subscribe set --targets "${{ inputs.targets }}"
+            ;;
+          subscribe_list)
+            python twitter_monitor.py subscribe list
+            ;;
+          query)
+            cmd=(python twitter_monitor.py query --limit "$INPUT_LIMIT" --output data/query_results/query-result.json)
+            if [[ -n "$INPUT_TARGET" ]]; then
+              cmd+=(--target "$INPUT_TARGET")
+            fi
+            if [[ -n "$INPUT_KEYWORD" ]]; then
+              cmd+=(--keyword "$INPUT_KEYWORD")
+            fi
+            if [[ -n "$INPUT_SINCE" ]]; then
+              cmd+=(--since "$INPUT_SINCE")
+            fi
+            if [[ -n "$INPUT_UNTIL" ]]; then
+              cmd+=(--until "$INPUT_UNTIL")
+            fi
+            "${cmd[@]}"
+            ;;
+          *)
+            echo "Unsupported action: ${{ inputs.action }}"
+            exit 1
+            ;;
+        esac
+      env:
+        INPUT_TARGET: ${{ inputs.target }}
+        INPUT_KEYWORD: ${{ inputs.keyword }}
+        INPUT_SINCE: ${{ inputs.since }}
+        INPUT_UNTIL: ${{ inputs.until }}
+        INPUT_LIMIT: ${{ inputs.limit }}
+
+    - name: Upload query result artifact
+      if: inputs.action == 'query'
+      uses: actions/upload-artifact@v4
+      with:
+        name: query-result
+        path: data/query_results/query-result.json
+        if-no-files-found: error
+
+    - name: Commit and push data changes
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+        git add -A data/subscriptions.json
+
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore: update subscription/query data [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push
+        fi

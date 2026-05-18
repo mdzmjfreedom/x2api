@@ -1,0 +1,11 @@
+{
+  "targets": [
+    "CONAN_tcg",
+    "UNION_ARENA_TCG",
+    "dbfw_cardgameJP",
+    "haikyu_vobaca",
+    "ONEPIECE_tcg",
+    "movic_jp"
+  ],
+  "updated_at": "2026-05-18T10:42:31.433856+00:00"
+}

@@ -1,192 +1,171 @@
-# 🚀 快速部署指南
+# GitHub Actions 部署指南
 
-本指南将帮助您在 5 分钟内完成 Twitter 监控机器人的部署。
+这个版本已经不再依赖钉钉，也不再要求把订阅目标写死在 `TWITTER_USER` Secret 里。现在的方式是：
 
-## 📋 前置准备
+- 定时抓取并保存到仓库本地数据文件
+- 通过 GitHub Actions 手动管理订阅
+- 通过 GitHub Actions 手动查询历史
+- 通过定时任务清理历史
 
-- [ ] GitHub 账号
-- [ ] 钉钉群组(用于接收通知)
-- [ ] Cloudflare 账号(可选,用于图片代理)
+## 第一步：Fork 仓库
 
----
+先把仓库 Fork 到你自己的 GitHub 账号下。
 
-## 第一步: Fork 仓库 (30 秒)
+## 第二步：开启 Actions 写权限
 
-1. 点击本仓库右上角的 **Fork** 按钮
-2. 等待 Fork 完成
+进入：
 
----
+`Settings -> Actions -> General -> Workflow permissions`
 
-## 第二步: 配置钉钉机器人 (2 分钟)
+选择：
 
-### 2.1 创建机器人
+`Read and write permissions`
 
-1. 打开钉钉群组
-2. 点击右上角 **···** → **智能群助手**
-3. 点击 **添加机器人** → **自定义**
-4. 输入机器人名称: `Twitter 监控`
+这是必须的，因为监控结果、订阅列表、清理后的数据都会自动提交回仓库。
 
-### 2.2 设置安全验证
+## 第三步：首次初始化
 
-- 选择 **自定义关键词**
-- 输入关键词: `Twitter`
-- 点击 **完成**
+进入 `Actions` 页面，按顺序手动运行：
 
-### 2.3 复制 Webhook
+1. `Update Nitter Instances`
+2. `Manage Subscriptions And Query`
+3. `Twitter Monitor`
 
-复制生成的 Webhook URL,格式类似:
-```
-https://oapi.dingtalk.com/robot/send?access_token=xxxxx
-```
+### 3.1 配置订阅
 
----
+手动运行 `Manage Subscriptions And Query` 时：
 
-## 第三步: 配置 Cloudflare 图片代理 (可选,2 分钟)
+- `action`: 选 `subscribe_set`
+- `targets`: 填你的订阅目标
 
-> **为什么需要?** 解决钉钉内无法显示 Twitter 图片的问题
+示例：
 
-### 3.1 登录 Cloudflare
-
-访问 https://dash.cloudflare.com/ 并登录(没有账号则注册)
-
-### 3.2 创建 Worker
-
-1. 点击左侧 **Workers & Pages**
-2. 点击 **Create Worker**
-3. 删除默认代码,粘贴 `cloudflare-worker.js` 的内容
-4. 点击 **Deploy**
-
-### 3.3 复制 Worker URL
-
-复制生成的 URL,格式类似:
-```
-https://twitter-img-proxy.your-name.workers.dev
+```text
+elonmusk,OpenAI,AnthropicAI
 ```
 
----
+或者：
 
-## 第四步: 配置 GitHub Secrets (2 分钟)
+```text
+elonmusk,search:AI safety,search:#ChatGPT
+```
 
-### 4.1 进入 Secrets 设置
+支持格式：
 
-1. 进入您 Fork 的仓库
-2. 点击 **Settings** → **Secrets and variables** → **Actions**
-3. 点击 **New repository secret**
+- 单个用户：`elonmusk`
+- 多个用户：`elonmusk,OpenAI,AnthropicAI`
+- 关键词搜索：`search:AI safety`
+- 混合：`elonmusk,search:#ChatGPT`
 
-### 4.2 添加必需的 Secrets
+### 3.2 验证监控
 
-#### Secret 1: TWITTER_USER (必需)
+运行 `Twitter Monitor`，它会：
 
-- **Name**: `TWITTER_USER`
-- **Value**: 监控目标,例如:
-  - 单个用户: `elonmusk`
-  - 多个用户: `elonmusk,OpenAI,AnthropicAI`
-  - 关键词搜索: `search:AI safety`
-  - 混合: `elonmusk,search:#ChatGPT`
+- 读取 `data/subscriptions.json`
+- 抓取每个订阅目标的最新动态
+- 保存到 `data/tweets.jsonl`
+- 更新 `data/last_id.json`
+- 自动提交到仓库
 
-#### Secret 2: DINGTALK_WEBHOOK (必需)
+## 第四步：查询历史
 
-- **Name**: `DINGTALK_WEBHOOK`
-- **Value**: 第二步复制的钉钉 Webhook URL
+手动运行 `Manage Subscriptions And Query`，将：
 
-#### Secret 3: CLOUDFLARE_PROXY (可选但推荐)
+- `action` 设为 `query`
 
-- **Name**: `CLOUDFLARE_PROXY`
-- **Value**: 第三步复制的 Cloudflare Worker URL
+可选输入：
 
----
+- `target`: 精确查询某个订阅目标
+- `keyword`: 按内容关键字查
+- `since`: 起始时间，ISO 8601
+- `until`: 结束时间，ISO 8601
+- `limit`: 返回条数
 
-## 第五步: 启用 GitHub Actions (1 分钟)
+示例：
 
-### 5.1 设置权限
+### 查询某个账号最近 10 条
 
-1. 进入 **Settings** → **Actions** → **General**
-2. 滚动到 **Workflow permissions**
-3. 选择 **Read and write permissions**
-4. 点击 **Save**
+- `action`: `query`
+- `target`: `OpenAI`
+- `limit`: `10`
 
-### 5.2 启用 Workflows
+### 查询包含关键词的记录
 
-1. 点击仓库顶部的 **Actions** 标签
-2. 如果看到提示,点击 **I understand my workflows, go ahead and enable them**
+- `action`: `query`
+- `keyword`: `GPT-5`
 
-### 5.3 手动测试
+### 按时间范围查询
 
-1. 点击左侧 **Update Nitter Instances**
-2. 点击 **Run workflow** → **Run workflow**
-3. 等待完成(约 30 秒)
-4. 点击左侧 **Twitter Monitor**
-5. 点击 **Run workflow** → **Run workflow**
-6. 等待完成(约 3-5 分钟)
-7. 检查钉钉群是否收到推送
+- `action`: `query`
+- `since`: `2026-05-01T00:00:00+00:00`
+- `until`: `2026-05-18T23:59:59+00:00`
 
----
+运行后你会看到：
 
-## ✅ 完成!
+- 日志里打印结果摘要
+- 一个名为 `query-result` 的 artifact，可直接下载 JSON
 
-如果一切正常,您应该:
-- ✅ 在钉钉群收到了测试推送
-- ✅ 看到 Actions 标签页显示绿色的 ✓
-- ✅ 仓库中生成了 `last_id.json` 和 `instances.json`
+## 第五步：清理历史
 
-从现在开始,机器人将每 10 分钟自动检查一次推文更新!
+`Cleanup Stored Tweets` 会每天自动运行一次，也可以手动触发。
 
----
+参数：
 
-## 🔧 常见问题排查
+- `retention_days`: 保留最近多少天
+- `max_records`: 最多保留多少条
 
-### 问题 1: Actions 运行失败
+例如：
 
-**症状**: Actions 标签页显示红色 ✗
+- 保留 15 天
+- 最多保留 500 条
 
-**解决方案**:
-1. 点击失败的 workflow 查看日志
-2. 检查是否正确设置了 `TWITTER_USER` 和 `DINGTALK_WEBHOOK`
-3. 确保 Workflow permissions 设置为 Read and write
+就填：
 
-### 问题 2: 没有收到钉钉推送
+- `retention_days`: `15`
+- `max_records`: `500`
 
-**可能原因**:
-- 钉钉机器人关键词设置错误(必须是 `Twitter`)
-- Webhook URL 复制错误
-- 监控的用户最近没有发推
+## 常见操作
 
-**解决方案**:
-1. 检查 Actions 日志中是否有 "钉钉推送成功" 字样
-2. 尝试监控一个活跃用户测试,如 `elonmusk`
-3. 重新创建钉钉机器人并更新 Webhook
+### 新增订阅
 
-### 问题 3: 图片无法显示
+运行 `Manage Subscriptions And Query`：
 
-**解决方案**:
-1. 确保已配置 `CLOUDFLARE_PROXY`
-2. 测试 Cloudflare Worker 是否正常工作:
-   ```
-   https://your-worker.workers.dev?url=https://pbs.twimg.com/media/test.jpg
-   ```
-3. 如果 Worker 有问题,检查代码是否完整复制
+- `action`: `subscribe_add`
+- `targets`: `vercel,search:Next.js`
 
-### 问题 4: 频繁收到重复推送
+### 删除订阅
 
-**解决方案**:
-1. 检查 `last_id.json` 是否正常提交到仓库
-2. 确保 Workflow permissions 设置正确
-3. 查看 Actions 日志中的 "Commit and push" 步骤
+- `action`: `subscribe_remove`
+- `targets`: `vercel`
 
----
+### 全量覆盖订阅
 
-## 📞 获取帮助
+- `action`: `subscribe_set`
+- `targets`: `OpenAI,AnthropicAI,search:AI safety`
 
-如果遇到其他问题:
-1. 查看 [README.md](README.md) 的常见问题部分
-2. 检查 GitHub Actions 的详细日志
-3. 在仓库中提交 Issue
+### 查看当前订阅
 
----
+- `action`: `subscribe_list`
 
-## 🎯 下一步
+## 旧配置兼容
 
-- 调整监控目标(修改 `TWITTER_USER` Secret)
-- 设置多个监控用户或关键词
-- 自定义钉钉消息格式(修改 `twitter_monitor.py`)
-- 部署到自己的服务器(设置 `LOOP_MODE=true`)
+如果你之前配置过：
+
+- `TWITTER_USER`
+- 根目录 `last_id.json`
+
+脚本会自动迁移，但后续建议全部改用：
+
+- `data/subscriptions.json`
+- `data/last_id.json`
+
+## 不再需要的 Secret
+
+这次改造后，这几个都不是必需项了：
+
+- `TWITTER_USER`
+- `DINGTALK_WEBHOOK`
+- `CLOUDFLARE_PROXY`
+- `IMGBB_API_KEY`
+
+除非你后面想继续扩展图片代理或消息推送，否则现在可以不配。

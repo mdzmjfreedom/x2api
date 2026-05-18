@@ -13,7 +13,7 @@ ENV/
 playwright-report/
 test-results/
 
-# 敏感数据 - 包含监控目标信息
+# 旧版状态文件（新版使用 data/ 目录）
 last_id.json
 
 # IDE
@@ -29,3 +29,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 查询结果是临时产物
+data/query_results/

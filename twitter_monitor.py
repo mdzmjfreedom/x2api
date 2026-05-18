@@ -1,38 +1,210 @@
-import os
-import time
-import random
+from __future__ import annotations
+
+import argparse
 import json
+import os
+import random
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse, urlunparse
+
 import requests
-from datetime import datetime
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 from bs4 import BeautifulSoup
-import tempfile
-import base64
 
-# 配置
-USERS_STR = os.environ.get('TWITTER_USER', 'elonmusk')
-USERS = [u.strip() for u in USERS_STR.split(',') if u.strip()]
-WEBHOOK_URL = os.environ.get('DINGTALK_WEBHOOK')
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LAST_ID_FILE = os.path.join(BASE_DIR, 'last_id.json')
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+LAST_ID_FILE = DATA_DIR / "last_id.json"
+SUBSCRIPTIONS_FILE = DATA_DIR / "subscriptions.json"
+TWEETS_FILE = DATA_DIR / "tweets.jsonl"
+QUERY_RESULTS_DIR = DATA_DIR / "query_results"
+INSTANCES_FILE = BASE_DIR / "instances.json"
+LEGACY_LAST_ID_FILE = BASE_DIR / "last_id.json"
 
-# 运行模式配置
-LOOP_MODE = os.environ.get('LOOP_MODE', 'false').lower() == 'true'
-INTERVAL = int(os.environ.get('LOOP_INTERVAL', '600')) # 默认 10 分钟 (600秒)
+DEFAULT_RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+DEFAULT_MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "2000"))
+AUTO_TRANSLATE = os.environ.get("TRANSLATE_CONTENT", "false").lower() == "true"
 
-# 备选 Nitter 实例 (仅作为域名参考)
+# 兼容旧配置，首次迁移时仍可从 Secret 中读取订阅目标
+LEGACY_USERS_ENV = os.environ.get("TWITTER_USER", "")
+
 NITTER_INSTANCES = [
-    'https://xcancel.com',
-    'https://nitter.privacyredirect.com',
-    'https://nitter.poast.org',
-    'https://nitter.hu',
-    'https://nitter.moomoo.me',
-    'https://nitter.net',
+    "https://xcancel.com",
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
+    "https://nitter.hu",
+    "https://nitter.moomoo.me",
+    "https://nitter.net",
 ]
 
-INSTANCES_FILE = os.path.join(BASE_DIR, 'instances.json')
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+
+def parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def ensure_data_dirs() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    QUERY_RESULTS_DIR.mkdir(exist_ok=True)
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        print(f"[系统] 读取 {path.name} 失败: {exc}")
+        return default
+
+
+def save_json(path: Path, payload) -> None:
+    ensure_data_dirs()
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def normalize_target(target: str) -> str:
+    return target.strip()
+
+
+def parse_targets(raw: str | list[str] | None) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        parts = raw
+    else:
+        parts = re.split(r"[\n,]+", raw)
+    targets = []
+    seen = set()
+    for part in parts:
+        target = normalize_target(part)
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        targets.append(target)
+    return targets
+
+
+def load_subscriptions() -> list[str]:
+    ensure_data_dirs()
+    if SUBSCRIPTIONS_FILE.exists():
+        payload = load_json(SUBSCRIPTIONS_FILE, default={})
+        targets = parse_targets(payload.get("targets", [])) if isinstance(payload, dict) else parse_targets(payload)
+        return targets
+
+    legacy_targets = parse_targets(LEGACY_USERS_ENV)
+    if legacy_targets:
+        print("[系统] 发现旧版 TWITTER_USER 配置，已作为初始订阅导入")
+        save_subscriptions(legacy_targets)
+        return legacy_targets
+
+    return []
+
+
+def save_subscriptions(targets: list[str]) -> None:
+    payload = {
+        "targets": targets,
+        "updated_at": now_iso(),
+    }
+    save_json(SUBSCRIPTIONS_FILE, payload)
+
+
+def load_last_ids() -> dict[str, str]:
+    ensure_data_dirs()
+    data = load_json(LAST_ID_FILE, default={})
+    if data:
+        return data
+
+    legacy = load_json(LEGACY_LAST_ID_FILE, default={})
+    if legacy:
+        print("[系统] 发现旧版 last_id.json，已迁移到 data/last_id.json")
+        save_last_ids(legacy)
+        return legacy
+
+    return {}
+
+
+def save_last_ids(last_ids: dict[str, str]) -> None:
+    save_json(LAST_ID_FILE, last_ids)
+
+
+def load_records() -> list[dict]:
+    ensure_data_dirs()
+    if not TWEETS_FILE.exists():
+        return []
+
+    records = []
+    with TWEETS_FILE.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(f"[系统] 跳过损坏记录: {exc}")
+    return records
+
+
+def append_record(record: dict) -> None:
+    ensure_data_dirs()
+    with TWEETS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def record_key(record: dict) -> str:
+    return f"{record.get('target', '')}:{record.get('guid', '')}"
+
+
+def cleanup_records(retention_days: int, max_records: int) -> dict[str, int]:
+    records = load_records()
+    before_count = len(records)
+    if before_count == 0:
+        return {"before": 0, "after": 0, "deleted": 0}
+
+    threshold = now_utc() - timedelta(days=retention_days)
+    kept = []
+    for record in records:
+        stored_at = parse_datetime(record.get("stored_at", ""))
+        if stored_at is None or stored_at >= threshold:
+            kept.append(record)
+
+    kept.sort(
+        key=lambda item: parse_datetime(item.get("stored_at", "")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    if max_records > 0:
+        kept = kept[:max_records]
+    kept.sort(
+        key=lambda item: parse_datetime(item.get("stored_at", "")) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    ensure_data_dirs()
+    if kept:
+        with TWEETS_FILE.open("w", encoding="utf-8") as fh:
+            for record in kept:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    elif TWEETS_FILE.exists():
+        TWEETS_FILE.unlink()
+
+    return {"before": before_count, "after": len(kept), "deleted": before_count - len(kept)}
+
 
 def get_random_user_agent():
     ua_list = [
@@ -40,37 +212,102 @@ def get_random_user_agent():
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/121.0.0.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
     ]
     return random.choice(ua_list)
 
+
 def load_instances():
-    """
-    从本地缓存加载健康的 Nitter 实例
-    """
-    if os.path.exists(INSTANCES_FILE):
+    if INSTANCES_FILE.exists():
         try:
-            with open(INSTANCES_FILE, 'r', encoding='utf-8') as f:
-                instances = json.load(f)
-                if instances and isinstance(instances, list):
-                    print(f"[系统] 成功从本地缓存加载 {len(instances)} 个实例")
-                    return instances
-        except Exception as e:
-            print(f"[系统] 加载实例缓存失败: {e}")
-    
+            with INSTANCES_FILE.open("r", encoding="utf-8") as fh:
+                instances = json.load(fh)
+            if instances and isinstance(instances, list):
+                print(f"[系统] 成功从本地缓存加载 {len(instances)} 个实例")
+                return instances
+        except Exception as exc:
+            print(f"[系统] 加载实例缓存失败: {exc}")
+
     print("[系统] 缓存不存在或损坏，采用内置兜底实例列表")
     return NITTER_INSTANCES
 
-def scrape_nitter_with_playwright(target, dynamic_instances=None):
-    """
-    使用 Playwright 模拟浏览器访问 Nitter 并抓取最新推文
-    """
-    is_search = target.startswith('search:')
+
+def get_original_image_url(nitter_url: str) -> str:
+    try:
+        if "pbs.twimg.com" in nitter_url:
+            return nitter_url
+
+        if "/pic/enc/" in nitter_url:
+            enc_part = nitter_url.split("/pic/enc/")[-1].split("?")[0]
+            try:
+                decoded = bytes.fromhex(enc_part).decode("utf-8")
+                if "pbs.twimg.com" in decoded:
+                    return decoded
+            except Exception:
+                pass
+
+        path = unquote(nitter_url)
+        if "/media/" in path:
+            media_part = path.split("/media/")[-1].split("?")[0]
+            if "." in media_part:
+                media_id, ext = media_part.rsplit(".", 1)
+                ext = ext.split("&")[0].split("?")[0]
+                return f"https://pbs.twimg.com/media/{media_id}?format={ext}&name=large"
+
+        match = re.search(r"(pbs\.twimg\.com/media/[^?&]+)", path)
+        if match:
+            return "https://" + match.group(1)
+    except Exception as exc:
+        print(f"[图片解析] 还原 URL 失败 {nitter_url}: {exc}")
+
+    return nitter_url
+
+
+def translate_text(text: str, target_lang: str = "zh-CN") -> str | None:
+    if not text or not text.strip():
+        return None
+
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "auto",
+                "tl": target_lang,
+                "dt": "t",
+                "q": text,
+            },
+            headers={"User-Agent": get_random_user_agent()},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data and data[0]:
+            return "".join(part[0] for part in data[0] if part and part[0])
+    except Exception as exc:
+        print(f"[翻译] 失败: {exc}")
+    return None
+
+
+def nitter_to_x_url(nitter_url: str) -> str:
+    if not nitter_url:
+        return ""
+    parsed = urlparse(nitter_url)
+    return urlunparse(("https", "x.com", parsed.path, "", parsed.query, ""))
+
+
+def scrape_nitter_with_playwright(target: str, dynamic_instances: list[str] | None = None) -> list[dict]:
+    try:
+        from playwright.sync_api import sync_playwright
+        from playwright_stealth import stealth_sync
+    except ModuleNotFoundError as exc:
+        print(f"[{target}] 缺少抓取依赖: {exc}")
+        return []
+
+    is_search = target.startswith("search:")
     keyword = target[7:] if is_search else target
-    
-    # 优先使用动态获取的实例，如果没有则用内置的
-    instances = dynamic_instances if dynamic_instances else NITTER_INSTANCES.copy()
-    # 为了分布压力，我们在保持高分实例在前的前提下，对前 5 名进行小范围随机
+
+    instances = list(dynamic_instances or NITTER_INSTANCES)
     if len(instances) > 5:
         top_5 = instances[:5]
         random.shuffle(top_5)
@@ -79,464 +316,385 @@ def scrape_nitter_with_playwright(target, dynamic_instances=None):
         instances = top_5 + others
     else:
         random.shuffle(instances)
-    
+
     with sync_playwright() as p:
-        # 启动浏览器 (头模式/无头模式取决于环境，GitHub Actions 建议 headless=True)
         browser = p.chromium.launch(headless=True)
-        
         for instance in instances:
+            context = None
             try:
-                # 每个实例创建一个新上下文，模拟干净的访问
                 context = browser.new_context(
                     user_agent=get_random_user_agent(),
-                    viewport={'width': 1280, 'height': 720}
+                    viewport={"width": 1280, "height": 720},
                 )
                 page = context.new_page()
-                
-                # 应用 Stealth 插件绕过检测
                 stealth_sync(page)
-                
+
                 if is_search:
-                    url = f"{instance.rstrip('/')}/search?f=tweets&q={requests.utils.quote(keyword)}"
+                    url = f"{instance.rstrip('/')}/search?f=tweets&q={quote(keyword)}"
                 else:
                     url = f"{instance.rstrip('/')}/{keyword}"
-                
+
                 print(f"[{target}] 正在加载: {url}")
-                
-                # 开始加载并处理可能的挑战
                 try:
                     response = page.goto(url, wait_until="networkidle", timeout=45000)
                     if response and response.status == 403:
                         print(f"[{target}] 访问 {instance} 被拒 (403 Forbidden)")
                         context.close()
+                        context = None
                         continue
-                except Exception as e:
-                    print(f"[{target}] 加载 {instance} 超时或失败: {e}")
+                except Exception as exc:
+                    print(f"[{target}] 加载 {instance} 超时或失败: {exc}")
                     context.close()
+                    context = None
                     continue
-                
-                # 智能等待浏览器验证或"稍等片刻"挑战
+
                 challenge_keywords = ["Verifying your browser", "Just a moment", "Checking your browser"]
-                for i in range(5): # 最多等待 25 秒
+                for _ in range(5):
                     content = page.content()
-                    if any(kw in content for kw in challenge_keywords):
-                        print(f"[{target}] 检测到浏览器验证 ({i+1}/5)，尝试等待...")
+                    if any(keyword in content for keyword in challenge_keywords):
                         page.wait_for_timeout(5000)
                     else:
                         break
-                
-                # 获取最终渲染后的 HTML
-                soup = BeautifulSoup(page.content(), 'html.parser')
-                
-                # Nitter 页面推文解析逻辑
-                items = soup.select('.timeline-item')
+
+                soup = BeautifulSoup(page.content(), "html.parser")
+                items = soup.select(".timeline-item")
                 if not items:
                     print(f"[{target}] 在实例 {instance} 上未发现推文内容")
                     context.close()
+                    context = None
                     continue
-                
-                # 扫描策略：扫描前 8 条推文，找到第一条非置顶的、有效的内容
+
                 valid_tweets = []
-                for item in items[:8]:
-                    # 1. 检查是否是置顶推文 (移除 "Pinned" text 匹配以防止误伤推文内容)
-                    is_pinned = item.select_one('.pinned') is not None
-                    if is_pinned:
+                for item in items[:20]:
+                    if item.select_one(".pinned") is not None:
                         print(f"[{target}] 发现置顶推文，跳过")
                         continue
-                    
-                    # 2. 检查是否是转发
-                    is_retweet = item.select_one('.retweet-header') is not None
 
-                    # 3. 提取图片 (增加更多可能的 Nitter 图片选择器)
+                    is_retweet = item.select_one(".retweet-header") is not None
                     images = []
-                    img_els = item.select('.attachment.image img, .tweet-image img, .still-image img, .attachments img')
-                    for img in img_els:
-                        # 排除头像 (通常在 .tweet-avatar 或 .profile-card-avatar 中)
-                        if any(c in str(img.parent.get('class', [])) for c in ['avatar', 'profile']):
+                    for img in item.select(".attachment.image img, .tweet-image img, .still-image img, .attachments img"):
+                        if any(cls in str(img.parent.get("class", [])) for cls in ["avatar", "profile"]):
                             continue
-                            
-                        src = img.get('src', '')
-                        if src:
-                            # 转换相对路径
-                            if src.startswith('//'):
-                                full_src = 'https:' + src
-                            elif src.startswith('/'):
-                                full_src = instance.rstrip('/') + src
-                            else:
-                                full_src = src
-                            
-                            # 还原原始 Twitter 图片链接以提高代理稳定性
-                            full_src = get_original_image_url(full_src)
-                            
-                            # 过滤掉一些明显的表情包或小图标 (可选)
-                            if 'emoji' in src.lower() or 'hashtag_click' in src:
-                                continue
-                                
-                            images.append(full_src)
+                        src = img.get("src", "")
+                        if not src or "emoji" in src.lower() or "hashtag_click" in src:
+                            continue
 
-                    # 4. 提取视频 (新增)
+                        if src.startswith("//"):
+                            full_src = "https:" + src
+                        elif src.startswith("/"):
+                            full_src = instance.rstrip("/") + src
+                        else:
+                            full_src = src
+                        images.append(get_original_image_url(full_src))
+
                     video_url = None
                     try:
-                        video_el = item.select_one('video source')
-                        if not video_el:
-                            video_el = item.select_one('video')
-                        
+                        video_el = item.select_one("video source") or item.select_one("video")
                         if video_el:
-                            # 尝试获取封面图作为额外图片
-                            poster_el = item.select_one('video')
+                            poster_el = item.select_one("video")
                             if poster_el:
-                                poster = poster_el.get('poster', '')
+                                poster = poster_el.get("poster", "")
                                 if poster:
-                                    if poster.startswith('//'):
-                                        full_poster = 'https:' + poster
-                                    elif poster.startswith('/'):
-                                        full_poster = instance.rstrip('/') + poster
+                                    if poster.startswith("//"):
+                                        full_poster = "https:" + poster
+                                    elif poster.startswith("/"):
+                                        full_poster = instance.rstrip("/") + poster
                                     else:
                                         full_poster = poster
-                                    # 尝试还原原始封面图地址并加入图片列表
                                     full_poster = get_original_image_url(full_poster)
                                     if full_poster not in images:
                                         images.append(full_poster)
 
-                            # 提取视频流地址
-                            v_src = video_el.get('src', '')
+                            v_src = video_el.get("src", "")
                             if v_src:
-                                if v_src.startswith('//'):
-                                    video_url = 'https:' + v_src
-                                elif v_src.startswith('/'):
-                                    video_url = instance.rstrip('/') + v_src
+                                if v_src.startswith("//"):
+                                    video_url = "https:" + v_src
+                                elif v_src.startswith("/"):
+                                    video_url = instance.rstrip("/") + v_src
                                 else:
                                     video_url = v_src
-                    except Exception as e:
-                        print(f"[{target}] 视频提取异常: {e}")
+                    except Exception as exc:
+                        print(f"[{target}] 视频提取异常: {exc}")
 
-                    # 提取关键信息
-                    content_el = item.select_one('.tweet-content')
-                    link_el = item.select_one('.tweet-link')
-                    date_el = item.select_one('.tweet-date a')
-                    author_el = item.select_one('.username')
-
+                    content_el = item.select_one(".tweet-content")
+                    link_el = item.select_one(".tweet-link")
+                    date_el = item.select_one(".tweet-date a")
+                    author_el = item.select_one(".username")
                     if not content_el or not link_el:
                         continue
 
-                    # 提取推文 ID (从 /user/status/123...#m 中提取数字)
-                    link_href = link_el.get('href', '')
-                    tweet_id = link_href.split('/status/')[-1].split('#')[0] if '/status/' in link_href else link_href
+                    link_href = link_el.get("href", "")
+                    tweet_id = link_href.split("/status/")[-1].split("#")[0] if "/status/" in link_href else link_href
+                    nitter_link = instance.rstrip("/") + link_href
+                    raw_content = content_el.get_text(strip=True)
+                    clean_content = raw_content.replace("€∋", "").strip()
 
-                    tweet_data = {
-                        'content': content_el.get_text(strip=True),
-                        'link': instance.rstrip('/') + link_href,
-                        'published': date_el.get('title', '') if date_el else 'Unknown Time',
-                        'author': author_el.get_text(strip=True) if author_el else keyword,
-                        'guid': tweet_id,
-                        'is_retweet': is_retweet,
-                        'images': images,
-                        'video_url': video_url
+                    tweet = {
+                        "target": target,
+                        "target_type": "search" if is_search else "user",
+                        "target_value": keyword,
+                        "content": clean_content,
+                        "raw_content": raw_content,
+                        "translated_content": translate_text(clean_content) if AUTO_TRANSLATE else None,
+                        "link": nitter_link,
+                        "x_url": nitter_to_x_url(nitter_link),
+                        "published": date_el.get("title", "") if date_el else "Unknown Time",
+                        "author": author_el.get_text(strip=True) if author_el else keyword,
+                        "guid": tweet_id,
+                        "is_retweet": is_retweet,
+                        "images": images,
+                        "video_url": video_url,
+                        "stored_at": now_iso(),
+                        "source_instance": instance,
                     }
-                    valid_tweets.append(tweet_data)
-                    
-                    # 只要找到了第一个非置顶的有效推文，我们就认为它是当前“最新的”
-                    if len(valid_tweets) >= 1:
-                        break
+                    valid_tweets.append(tweet)
 
                 if valid_tweets:
-                    tweet = valid_tweets[0]
-                    retweet_tag = " [转发]" if tweet['is_retweet'] else ""
-                    print(f"[{target}] 成功从 {instance} 抓取{retweet_tag}推文: {tweet['guid']}")
+                    newest_id = valid_tweets[0]["guid"]
+                    print(f"[{target}] 成功从 {instance} 抓取 {len(valid_tweets)} 条候选推文，最新 ID: {newest_id}")
                     context.close()
                     browser.close()
-                    return tweet
+                    return valid_tweets
 
                 print(f"[{target}] {instance} 页面上未找到符合条件的非置顶推文")
                 context.close()
+                context = None
+            except Exception as exc:
+                print(f"[{target}] 访问 {instance} 出错: {exc}")
+            finally:
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
-            except Exception as e:
-                print(f"[{target}] 访问 {instance} 出错: {e}")
-                continue
-        
         browser.close()
-    return None
-
-def upload_to_imgbb(image_url):
-    """
-    上传图片到 ImgBB 图床
-    需要配置环境变量: IMGBB_API_KEY
-    """
-    api_key = os.environ.get('IMGBB_API_KEY', '').strip()
-    if not api_key:
-        print("[图床] ImgBB 未配置 API Key, 无法上传")
-        return None
-    
-    try:
-        # 下载图片
-        print(f"[图床] 正在从 {image_url} 下载图片...")
-        img_response = requests.get(image_url, timeout=30, headers={
-            'User-Agent': get_random_user_agent(),
-            'Referer': 'https://twitter.com/'
-        })
-        img_response.raise_for_status()
-        
-        # 转换为 base64
-        img_base64 = base64.b64encode(img_response.content).decode('utf-8')
-        
-        # 上传到 ImgBB
-        print("[图床] 正在上传到 ImgBB...")
-        upload_response = requests.post(
-            'https://api.imgbb.com/1/upload',
-            data={
-                'key': api_key,
-                'image': img_base64
-            },
-            timeout=30
-        )
-        result = upload_response.json()
-        
-        if result.get('success'):
-            url = result['data']['url']
-            print(f"[图床] ImgBB 上传成功: {url}")
-            return url
-        else:
-            print(f"[图床] ImgBB 上传失败: {result}")
-            return None
-    except Exception as e:
-        print(f"[图床] ImgBB 上传异常: {e}")
-        return None
-
-def upload_image_to_bed(image_url):
-    """
-    上传图片到 ImgBB 图床
-    """
-    return upload_to_imgbb(image_url)
+    return []
 
 
+def print_record(record: dict, index: int | None = None) -> None:
+    prefix = f"{index}. " if index is not None else ""
+    print(f"{prefix}[{record.get('stored_at', '-')}] {record.get('target', '-')}")
+    print(f"   作者: {record.get('author', '-')}")
+    print(f"   ID: {record.get('guid', '-')}")
+    print(f"   内容: {record.get('content', '').strip()}")
+    if record.get("translated_content"):
+        print(f"   翻译: {record['translated_content']}")
+    print(f"   Nitter: {record.get('link', '-')}")
+    if record.get("x_url"):
+        print(f"   X: {record['x_url']}")
+    if record.get("images"):
+        print(f"   图片数: {len(record['images'])}")
+    if record.get("video_url"):
+        print(f"   视频: {record['video_url']}")
+    print("")
 
-def send_dingtalk(webhook_url, tweet, target):
-    """
-    发送钉钉消息
-    """
-    if not webhook_url:
-        print("未配置 DINGTALK_WEBHOOK，跳过发送")
-        return False
 
-    retweet_flag = " 🔃 转发了" if tweet.get('is_retweet') else " 📝 发布了"
-    
-    # 尝试翻译内容
-    print(f"[{target}] 正在翻译推文内容...")
-    
-    # 清理原文中的乱码或装饰性字符
-    raw_content = tweet['content']
-    # 移除特定乱码序列 €∋
-    clean_content = raw_content.replace('€∋', '').strip()
-    
-    translated_content = translate_text(clean_content)
-    
-    # 构造内容展示 (如果有翻译则显示翻译+原文)
-    if translated_content:
-        display_content = f"""**翻译**: {translated_content}\n\n**原文**: {raw_content}"""
-    else:
-        display_content = f"""{raw_content}"""
+def command_monitor(args) -> int:
+    targets = parse_targets(args.targets) if args.targets else load_subscriptions()
+    if not targets:
+        print("[系统] 当前没有订阅目标，跳过本轮监控")
+        return 0
 
-    # 构造图片 Markdown (优先使用图床,回退到代理)
-    images_md = ""
-    if tweet.get('images'):
-        # 检查是否启用图床上传
-        use_image_bed = os.environ.get('USE_IMAGE_BED', 'true').lower() == 'true'
-        
-        for img_url in tweet['images']:
-            import urllib.parse
-            
-            final_url = None
-            
-            # 方案1: 尝试上传到图床 (推荐)
-            if use_image_bed:
-                print(f"[{target}] 正在上传图片到图床...")
-                final_url = upload_image_to_bed(img_url)
-            
-            # 方案2: 如果图床失败,使用代理服务
-            if not final_url:
-                cloudflare_proxy = os.environ.get('CLOUDFLARE_PROXY', '').strip()
-                if cloudflare_proxy:
-                    encoded_url = urllib.parse.quote(img_url)
-                    final_url = f"{cloudflare_proxy.rstrip('/')}?url={encoded_url}"
-                else:
-                    # 回退到 wsrv.nl 代理
-                    clean_url = img_url.replace('https://', '').replace('http://', '')
-                    encoded_url = urllib.parse.quote(clean_url)
-                    final_url = f"https://wsrv.nl/?url={encoded_url}"
-            
-            if final_url:
-                images_md += f"\n\n![image]({final_url})"
-
-    # 如果有视频链接，添加观看链接
-    if tweet.get('video_url'):
-        images_md += f"\n\n[🎬 点击观看视频]({tweet['video_url']})"
-
-    title = f"Twitter 监控: {target}"
-    text = f"""## {target}{retweet_flag} 推文
----
-**作者**: {tweet['author']}
-**时间**: {tweet['published']}
-
-> {display_content}
-{images_md}
-
----
-[🔗 Nitter 原文]({tweet['link']}) | [🔗 Twitter(X) 原文]({tweet['link'].replace('xcancel.com', 'twitter.com').replace('nitter.net', 'twitter.com').replace('nitter.hu', 'twitter.com').replace('nitter.privacyredirect.com', 'twitter.com').replace('nitter.poast.org', 'twitter.com')})
-    """
-
-    data = {
-        "msgtype": "markdown",
-        "markdown": {
-            "title": title,
-            "text": text
-        }
-    }
-
-    try:
-        resp = requests.post(webhook_url, json=data, timeout=10)
-        result = resp.json()
-        if result.get('errcode') == 0:
-            print(f"[{target}] 钉钉推送成功")
-            return True
-        else:
-            print(f"[{target}] 钉钉推送失败: {result}")
-            return False
-    except Exception as e:
-        print(f"[{target}] 钉钉请求异常: {e}")
-        return False
-
-def get_original_image_url(nitter_url):
-    """
-    尝试从 Nitter 的代理 URL 中还原出 Twitter/X 的原始图片地址
-    例如: /pic/media%2FGDR-yXfbsAA_JmS.jpg -> pbs.twimg.com
-    """
-    import urllib.parse
-    import re
-    try:
-        if 'pbs.twimg.com' in nitter_url:
-            return nitter_url
-            
-        # 1. 处理 hex 编码的对象 (常见于 xcancel 等实例)
-        if '/pic/enc/' in nitter_url:
-            enc_part = nitter_url.split('/pic/enc/')[-1].split('?')[0]
-            try:
-                decoded = bytes.fromhex(enc_part).decode('utf-8')
-                if 'pbs.twimg.com' in decoded:
-                    return decoded
-            except:
-                pass
-
-        # 2. 处理标准 Nitter 路径
-        path = urllib.parse.unquote(nitter_url)
-        
-        # 匹配 /pic/media/ID.ext 或 /pic/orig/media/ID.ext
-        if '/media/' in path:
-            media_part = path.split('/media/')[-1].split('?')[0]
-            if '.' in media_part:
-                media_id, ext = media_part.rsplit('.', 1)
-                # 某些时候 ext 后面可能还跟着 &name=...
-                ext = ext.split('&')[0].split('?')[0]
-                return f"https://pbs.twimg.com/media/{media_id}?format={ext}&name=large"
-
-        # 3. 处理直接包含 pbs.twimg.com 的路径 (如 /pic/pbs.twimg.com/media/...)
-        if 'pbs.twimg.com' in path:
-            # 提取从 pbs.twimg.com 开始的部分
-            match = re.search(r'(pbs\.twimg\.com/media/[^?&]+)', path)
-            if match:
-                return "https://" + match.group(1)
-
-    except Exception as e:
-        print(f"[图片解析] 还原 URL 失败 {nitter_url}: {e}")
-        
-    return nitter_url
-
-def translate_text(text, target_lang='zh-CN'):
-    """
-    使用 Google Translate (GTX) 接口进行免费翻译
-    """
-    if not text or not text.strip():
-        return ""
-    
-    # 简单的翻译逻辑
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
-            "client": "gtx",
-            "sl": "auto",
-            "tl": target_lang,
-            "dt": "t",
-            "q": text
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        
-        # 解析返回的 JSON
-        data = resp.json()
-        if data and data[0]:
-            translated_parts = [part[0] for part in data[0] if part[0]]
-            return "".join(translated_parts)
-    except Exception as e:
-        print(f"[翻译] 失败: {e}")
-    
-    return None
-
-def main():
-    if not USERS:
-        print("没有配置监控目标")
-        return
-
-    print(f"[{datetime.now()}] 启动监控模式 (LOOP_MODE={LOOP_MODE}, INTERVAL={INTERVAL}s)...")
-    
-    # 从本地缓存加载可用实例
+    retention_days = args.retention_days if args.retention_days is not None else DEFAULT_RETENTION_DAYS
+    max_records = args.max_records if args.max_records is not None else DEFAULT_MAX_RECORDS
+    last_ids = load_last_ids()
+    existing_records = load_records()
+    existing_keys = {record_key(record) for record in existing_records}
     instances = load_instances()
 
-    while True:
-        cycle_start = time.time()
-        print(f"\n--- 启动新一轮监控轮询 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
-        
-        # 加载状态 (每轮都重新加载，防止外部手动修改或异常)
-        if os.path.exists(LAST_ID_FILE):
-            try:
-                with open(LAST_ID_FILE, 'r', encoding='utf-8') as f:
-                    last_ids = json.load(f)
-            except: last_ids = {}
-        else: last_ids = {}
+    print(f"[{datetime.now()}] 开始监控，共 {len(targets)} 个目标")
+    new_records = 0
+    for target in targets:
+        try:
+            tweets = scrape_nitter_with_playwright(target, instances)
+            if not tweets:
+                continue
 
-        updated = False
-        for target in USERS:
-            try:
-                tweet = scrape_nitter_with_playwright(target, instances)
-                if not tweet:
+            current_id = tweets[0]["guid"]
+            previous_id = last_ids.get(target)
+            if previous_id == current_id:
+                print(f"[{target}] 无更新")
+                continue
+
+            pending_records = []
+            for tweet in tweets:
+                if previous_id and tweet["guid"] == previous_id:
+                    break
+
+                key = record_key(tweet)
+                if key in existing_keys:
                     continue
-                
-                current_id = tweet['guid']
-                if last_ids.get(target) != current_id:
-                    print(f"[{target}] 发现更新: {current_id}")
-                    if send_dingtalk(WEBHOOK_URL, tweet, target):
-                        last_ids[target] = current_id
-                        updated = True
-                else:
-                    print(f"[{target}] 无视更新 (ID 未变)")
-            except Exception as e:
-                print(f"[{target}] 处理异常: {e}")
 
-        if updated:
-            with open(LAST_ID_FILE, 'w', encoding='utf-8') as f:
-                json.dump(last_ids, f, indent=2, ensure_ascii=False)
-            print("[系统] 状态文件已更新")
+                pending_records.append(tweet)
 
-        if not LOOP_MODE:
-            print("[系统] 非循环模式，任务结束。")
-            break
-        
-        # 计算需要 sleep 的时间，减去已经消耗的时间
-        elapsed = time.time() - cycle_start
-        sleep_time = max(10, INTERVAL - elapsed)
-        print(f"--- 轮询结束。耗时 {elapsed:.1f}s，准备休眠 {sleep_time:.1f}s ---\n")
-        time.sleep(sleep_time)
+            for tweet in reversed(pending_records):
+                append_record(tweet)
+                existing_keys.add(record_key(tweet))
+
+            last_ids[target] = current_id
+            new_records += len(pending_records)
+            print(f"[{target}] 已保存 {len(pending_records)} 条新记录到本地存储")
+        except Exception as exc:
+            print(f"[{target}] 处理异常: {exc}")
+
+    save_last_ids(last_ids)
+    print(f"[系统] 本轮新增 {new_records} 条记录")
+
+    if not args.skip_cleanup:
+        stats = cleanup_records(retention_days, max_records)
+        print(
+            f"[系统] 清理完成: 保留 {stats['after']} 条，删除 {stats['deleted']} 条 "
+            f"(retention_days={retention_days}, max_records={max_records})"
+        )
+    return 0
+
+
+def command_subscribe(args) -> int:
+    current = load_subscriptions()
+    current_set = set(current)
+
+    if args.action == "list":
+        if not current:
+            print("[系统] 当前没有订阅目标")
+            return 0
+        print("[系统] 当前订阅列表:")
+        for idx, target in enumerate(current, start=1):
+            print(f"{idx}. {target}")
+        return 0
+
+    raw_targets = args.targets
+    targets = parse_targets(raw_targets)
+    if args.action not in {"list", "set"} and not targets:
+        print("[系统] 请通过 --targets 提供目标")
+        return 1
+    if args.action == "set" and raw_targets is None:
+        print("[系统] set 动作需要显式提供 --targets，可传空字符串清空订阅")
+        return 1
+
+    if args.action == "add":
+        updated = current[:]
+        for target in targets:
+            if target not in current_set:
+                updated.append(target)
+                current_set.add(target)
+        save_subscriptions(updated)
+        print(f"[系统] 已新增 {len(updated) - len(current)} 个订阅目标")
+    elif args.action == "remove":
+        updated = [target for target in current if target not in set(targets)]
+        save_subscriptions(updated)
+        print(f"[系统] 已移除 {len(current) - len(updated)} 个订阅目标")
+    elif args.action == "set":
+        save_subscriptions(targets)
+        print(f"[系统] 已重置订阅列表，共 {len(targets)} 个目标")
+    else:
+        print(f"[系统] 未知订阅动作: {args.action}")
+        return 1
+
+    return 0
+
+
+def record_matches(record: dict, args) -> bool:
+    if args.target and record.get("target") != args.target:
+        return False
+
+    if args.keyword:
+        haystacks = [
+            record.get("content", ""),
+            record.get("raw_content", ""),
+            record.get("translated_content", "") or "",
+            record.get("author", ""),
+        ]
+        merged = "\n".join(haystacks).lower()
+        if args.keyword.lower() not in merged:
+            return False
+
+    stored_at = parse_datetime(record.get("stored_at", ""))
+    if args.since:
+        since_dt = parse_datetime(args.since)
+        if since_dt and stored_at and stored_at < since_dt:
+            return False
+    if args.until:
+        until_dt = parse_datetime(args.until)
+        if until_dt and stored_at and stored_at > until_dt:
+            return False
+    return True
+
+
+def command_query(args) -> int:
+    records = load_records()
+    filtered = [record for record in records if record_matches(record, args)]
+    filtered.sort(
+        key=lambda item: parse_datetime(item.get("stored_at", "")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    if args.limit > 0:
+        filtered = filtered[: args.limit]
+
+    print(f"[系统] 查询结果 {len(filtered)} 条")
+    for idx, record in enumerate(filtered, start=1):
+        print_record(record, idx)
+
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as fh:
+            json.dump(filtered, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        print(f"[系统] 查询结果已写入 {output_path}")
+
+    return 0
+
+
+def command_cleanup(args) -> int:
+    retention_days = args.retention_days if args.retention_days is not None else DEFAULT_RETENTION_DAYS
+    max_records = args.max_records if args.max_records is not None else DEFAULT_MAX_RECORDS
+    stats = cleanup_records(retention_days, max_records)
+    print(
+        f"[系统] 清理完成: 处理前 {stats['before']} 条，处理后 {stats['after']} 条，"
+        f"删除 {stats['deleted']} 条"
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Twitter/X 监控与本地存储工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    monitor_parser = subparsers.add_parser("monitor", help="抓取订阅目标并保存最新推文")
+    monitor_parser.add_argument("--targets", help="覆盖订阅列表，逗号或换行分隔")
+    monitor_parser.add_argument("--retention-days", type=int, default=None, help="保留天数")
+    monitor_parser.add_argument("--max-records", type=int, default=None, help="最大保留记录数")
+    monitor_parser.add_argument("--skip-cleanup", action="store_true", help="本轮监控后不执行清理")
+    monitor_parser.set_defaults(func=command_monitor)
+
+    subscribe_parser = subparsers.add_parser("subscribe", help="管理订阅列表")
+    subscribe_parser.add_argument("action", choices=["add", "remove", "set", "list"], help="订阅动作")
+    subscribe_parser.add_argument("--targets", help="目标列表，逗号或换行分隔")
+    subscribe_parser.set_defaults(func=command_subscribe)
+
+    query_parser = subparsers.add_parser("query", help="查询历史保存结果")
+    query_parser.add_argument("--target", help="按订阅目标精确过滤")
+    query_parser.add_argument("--keyword", help="按内容关键字过滤")
+    query_parser.add_argument("--since", help="起始时间，ISO 8601，例如 2026-05-01T00:00:00+00:00")
+    query_parser.add_argument("--until", help="结束时间，ISO 8601，例如 2026-05-31T23:59:59+00:00")
+    query_parser.add_argument("--limit", type=int, default=20, help="最大返回条数")
+    query_parser.add_argument("--output", help="将查询结果写入 JSON 文件")
+    query_parser.set_defaults(func=command_query)
+
+    cleanup_parser = subparsers.add_parser("cleanup", help="清理历史记录")
+    cleanup_parser.add_argument("--retention-days", type=int, default=None, help="保留天数")
+    cleanup_parser.add_argument("--max-records", type=int, default=None, help="最大保留记录数")
+    cleanup_parser.set_defaults(func=command_cleanup)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
