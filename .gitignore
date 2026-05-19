@@ -46,3 +46,4 @@ service/.vercel/
 # Database scratch
 .pgdata/
 .pgsocket/
+.vercel

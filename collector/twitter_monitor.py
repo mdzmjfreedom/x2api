@@ -89,7 +89,9 @@ def require_database_url() -> str:
 
 
 def get_db_connection():
-    return connect(require_database_url(), row_factory=dict_row)
+    # Supabase transaction pooler is the safest fit for short-lived jobs such
+    # as GitHub Actions, but it doesn't support prepared statements.
+    return connect(require_database_url(), row_factory=dict_row, prepare_threshold=None)
 
 
 def normalize_target(target: str) -> str:

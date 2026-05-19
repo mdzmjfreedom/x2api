@@ -37,6 +37,11 @@ psql "$DATABASE_URL" -f shared/schema.sql
 - GitHub Actions secret: `IMGBB_API_KEY`
 - Vercel project env: `DATABASE_URL`
 
+如果你使用 Supabase：
+
+- Vercel 和 GitHub Actions 优先使用 `Transaction pooler` 连接串
+- 不要在这些 serverless / CI 场景里使用 `db.<project-ref>.supabase.co:5432` 这种 direct connection
+
 ## 本地运行
 
 ### 1. 安装 service 依赖
