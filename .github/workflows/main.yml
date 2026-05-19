@@ -5,8 +5,9 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    - cron: '*/25 * * * *'
+  # schedule:
+  #   - cron: '*/10 * * * *'
+  # 定时触发已停用，当前由 UptimeRobot 等外部系统调用 workflow_dispatch。
   workflow_dispatch:
     inputs:
       shard_count:
