@@ -332,6 +332,11 @@ def upload_to_imgbb(image_url: str) -> str | None:
     if not IMGBB_API_KEY:
         return None
 
+    original_url = image_url
+    image_url = get_original_image_url(image_url)
+    if image_url != original_url:
+        print(f"[图床] 已还原图片地址: {image_url}")
+
     try:
         print(f"[图床] 正在从 {image_url} 下载图片...")
         img_response = requests.get(
@@ -343,6 +348,10 @@ def upload_to_imgbb(image_url: str) -> str | None:
             },
         )
         img_response.raise_for_status()
+        content_type = img_response.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("image/"):
+            print(f"[图床] 下载结果不是图片，跳过上传: {content_type or 'unknown'}")
+            return None
 
         image_base64 = base64.b64encode(img_response.content).decode("utf-8")
         print("[图床] 正在上传到 ImgBB...")
