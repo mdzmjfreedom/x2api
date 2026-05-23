@@ -1,4 +1,4 @@
-import { getSql } from "@/lib/db";
+import { getSql, type QueryChunk } from "@/lib/db";
 import { buildCursorPage, decodeCursor, normalizeLimit } from "@/lib/pagination";
 import { asRows } from "@/lib/sql-result";
 
@@ -64,6 +64,18 @@ function isVideoFeedCursor(value: unknown): value is VideoFeedCursor {
   );
 }
 
+function videoKeyExpression(alias: "i" | "watched_item"): QueryChunk {
+  return {
+    text: `
+    CASE
+      WHEN ${alias}.video_url LIKE 'https://video.twimg.com/%' THEN split_part(${alias}.video_url, '?', 1)
+      ELSE ${alias}.video_url
+    END
+  `,
+    values: [],
+  };
+}
+
 export function parseVideoFeedSource(raw: string | null): VideoFeedSource {
   if (!raw) {
     return "mixed";
@@ -99,6 +111,8 @@ export async function listVideoFeed(query: VideoFeedQuery) {
   const normalizedTag = query.tag?.trim().toLowerCase() || null;
   const normalizedCategory = query.category?.trim().toLowerCase() || null;
   const source = query.source ?? "mixed";
+  const itemVideoKey = videoKeyExpression("i");
+  const watchedVideoKey = videoKeyExpression("watched_item");
 
   const rows = asRows<VideoFeedRow>(await sql`
     WITH candidate_items AS (
@@ -106,6 +120,7 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         i.id,
         i.target_id AS "targetId",
         i.video_url AS "videoUrl",
+        ${itemVideoKey} AS "videoKey",
         COALESCE(i.metadata->>'video_poster_url', i.images->>0) AS "coverUrl",
         i.title,
         COALESCE(i.translated_content, i.content, i.raw_content) AS caption,
@@ -130,7 +145,7 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         COALESCE(vs.shares, 0) AS shares,
         COALESCE(vs.score, 0) AS score,
         ROW_NUMBER() OVER (
-          PARTITION BY i.guid
+          PARTITION BY ${itemVideoKey}
           ORDER BY COALESCE(i.published_at, i.stored_at) DESC, i.stored_at DESC, i.id DESC
         ) AS "dedupeRank"
       FROM items i
@@ -162,10 +177,11 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         AND NOT EXISTS (
           SELECT 1
           FROM feed_events fe
+          INNER JOIN items watched_item ON watched_item.id = fe.item_id
           WHERE fe.client_id = ${query.clientId}
-            AND fe.item_id = i.id
             AND fe.event_type IN ('impression', 'play', 'finish', 'dislike')
             AND fe.created_at >= NOW() - INTERVAL '7 days'
+            AND ${watchedVideoKey} = ${itemVideoKey}
         )
         AND (
           ${normalizedTag}::text IS NULL
