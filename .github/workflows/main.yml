@@ -10,10 +10,14 @@ on:
   # 定时触发已停用，当前由 UptimeRobot 等外部系统调用 workflow_dispatch。
   workflow_dispatch:
     inputs:
-      shard_count:
-        description: '监控分片数，默认 4'
+      shard_index:
+        description: '当前分片编号 0..N-1；填 all 可在单仓库跑全部分片；默认读取仓库变量 MONITOR_SHARD_INDEX，否则 0'
         required: false
-        default: '4'
+        default: ''
+      shard_count:
+        description: '总分片数；默认读取仓库变量 MONITOR_SHARD_COUNT，否则 4'
+        required: false
+        default: ''
 
 jobs:
   prepare:
@@ -26,23 +30,38 @@ jobs:
       - name: Build shard matrix
         id: matrix
         env:
-          INPUT_SHARD_COUNT: ${{ inputs.shard_count || '4' }}
+          INPUT_SHARD_INDEX: ${{ inputs.shard_index || vars.MONITOR_SHARD_INDEX || '0' }}
+          INPUT_SHARD_COUNT: ${{ inputs.shard_count || vars.MONITOR_SHARD_COUNT || '4' }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import json
           import os
 
-          raw_count = (os.environ.get("INPUT_SHARD_COUNT") or "1").strip()
+          raw_index = (os.environ.get("INPUT_SHARD_INDEX") or "0").strip().lower()
+          raw_count = (os.environ.get("INPUT_SHARD_COUNT") or "4").strip()
           try:
               shard_count = int(raw_count)
           except ValueError:
-              shard_count = 1
+              shard_count = 4
 
           if shard_count <= 0:
-              shard_count = 1
+              shard_count = 4
 
-          matrix = {"shard": list(range(shard_count))}
+          if raw_index == "all":
+              shards = list(range(shard_count))
+          else:
+              try:
+                  shard_index = int(raw_index)
+              except ValueError as exc:
+                  raise ValueError("shard_index must be an integer or 'all'.") from exc
+
+              if shard_index < 0 or shard_index >= shard_count:
+                  raise ValueError("shard_index must be between 0 and shard_count - 1.")
+
+              shards = [shard_index]
+
+          matrix = {"shard": shards}
           github_output = os.environ["GITHUB_OUTPUT"]
           with open(github_output, "a", encoding="utf-8") as fh:
               fh.write(f"shard_matrix={json.dumps(matrix)}\n")
