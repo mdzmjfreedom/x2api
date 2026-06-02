@@ -6,7 +6,8 @@ import { listVideoCategories } from "@/lib/video-feed-service";
 type DbSubscriptionRow = {
   subscriptionId: string;
   targetId: string;
-  kind: "user" | "keyword";
+  source: "twitter" | "youtube";
+  kind: "user" | "keyword" | "channel";
   value: string;
   category: string | null;
   tags: string[] | null;
@@ -41,23 +42,25 @@ async function ensureTargets(targets: ParsedTarget[]) {
 
   for (const target of targets) {
     await sql`
-      INSERT INTO targets (kind, value, normalized_value)
-      VALUES (${target.kind}, ${target.value}, ${target.normalizedValue})
-      ON CONFLICT (kind, normalized_value)
+      INSERT INTO targets (source, kind, value, normalized_value)
+      VALUES (${target.source}, ${target.kind}, ${target.value}, ${target.normalizedValue})
+      ON CONFLICT (source, kind, normalized_value)
       DO UPDATE SET value = EXCLUDED.value
     `;
   }
 
-  const ensuredTargets: { id: string; kind: "user" | "keyword"; value: string; normalizedValue: string }[] = [];
+  const ensuredTargets: { id: string; source: "twitter" | "youtube"; kind: "user" | "keyword" | "channel"; value: string; normalizedValue: string }[] = [];
   for (const target of targets) {
-    const rows = asRows<{ id: string; kind: "user" | "keyword"; value: string; normalizedValue: string }>(await sql`
+    const rows = asRows<{ id: string; source: "twitter" | "youtube"; kind: "user" | "keyword" | "channel"; value: string; normalizedValue: string }>(await sql`
       SELECT
         id,
+        source,
         kind,
         value,
         normalized_value AS "normalizedValue"
       FROM targets
-      WHERE kind = ${target.kind}
+      WHERE source = ${target.source}
+        AND kind = ${target.kind}
         AND normalized_value = ${target.normalizedValue}
       LIMIT 1
     `);
@@ -82,7 +85,8 @@ async function upsertTargetProfiles(targets: ParsedTarget[]) {
       INSERT INTO target_profiles (target_id, scope, tags, category, weight, is_public_pool)
       SELECT id, 'user', ${JSON.stringify(target.tags)}::jsonb, ${category}, 0, FALSE
       FROM targets
-      WHERE kind = ${target.kind}
+      WHERE source = ${target.source}
+        AND kind = ${target.kind}
         AND normalized_value = ${target.normalizedValue}
       ON CONFLICT (target_id) DO UPDATE SET
         scope = CASE WHEN target_profiles.scope = 'system' THEN target_profiles.scope ELSE 'user' END,
@@ -99,6 +103,7 @@ export async function listSubscriptions(clientId: string) {
     SELECT
       s.id AS "subscriptionId",
       t.id AS "targetId",
+      t.source,
       t.kind,
       t.value,
       tp.category,
@@ -108,13 +113,14 @@ export async function listSubscriptions(clientId: string) {
     INNER JOIN targets t ON t.id = s.target_id
     LEFT JOIN target_profiles tp ON tp.target_id = t.id
     WHERE s.client_id = ${clientId}
-    ORDER BY t.kind, LOWER(t.value)
+    ORDER BY t.source, t.kind, LOWER(t.value)
   `);
 
   return rows.map((row) => ({
     id: row.subscriptionId,
     targetId: row.targetId,
-    target: formatTarget({ kind: row.kind, value: row.value }),
+    target: formatTarget({ source: row.source, kind: row.kind, value: row.value }),
+    source: row.source,
     kind: row.kind,
     value: row.value,
     category: row.category,
@@ -176,7 +182,8 @@ export async function removeSubscriptions(clientId: string, rawTargets: unknown)
         AND target_id IN (
           SELECT id
           FROM targets
-          WHERE kind = ${target.kind}
+          WHERE source = ${target.source}
+            AND kind = ${target.kind}
             AND normalized_value = ${target.normalizedValue}
         )
     `;

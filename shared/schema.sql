@@ -14,14 +14,27 @@ CREATE TABLE IF NOT EXISTS clients (
 
 CREATE TABLE IF NOT EXISTS targets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source TEXT NOT NULL DEFAULT 'twitter',
     kind TEXT NOT NULL,
     value TEXT NOT NULL,
     normalized_value TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT targets_kind_check CHECK (kind IN ('user', 'keyword')),
-    CONSTRAINT targets_unique_normalized UNIQUE (kind, normalized_value)
+    CONSTRAINT targets_source_check CHECK (source IN ('twitter', 'youtube')),
+    CONSTRAINT targets_kind_check CHECK (kind IN ('user', 'keyword', 'channel')),
+    CONSTRAINT targets_youtube_kind_check CHECK (source <> 'youtube' OR kind = 'channel'),
+    CONSTRAINT targets_unique_normalized UNIQUE (source, kind, normalized_value)
 );
+
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'twitter';
+ALTER TABLE targets DROP CONSTRAINT IF EXISTS targets_unique_normalized;
+ALTER TABLE targets DROP CONSTRAINT IF EXISTS targets_kind_check;
+ALTER TABLE targets DROP CONSTRAINT IF EXISTS targets_source_check;
+ALTER TABLE targets DROP CONSTRAINT IF EXISTS targets_youtube_kind_check;
+ALTER TABLE targets ADD CONSTRAINT targets_source_check CHECK (source IN ('twitter', 'youtube'));
+ALTER TABLE targets ADD CONSTRAINT targets_kind_check CHECK (kind IN ('user', 'keyword', 'channel'));
+ALTER TABLE targets ADD CONSTRAINT targets_youtube_kind_check CHECK (source <> 'youtube' OR kind = 'channel');
+ALTER TABLE targets ADD CONSTRAINT targets_unique_normalized UNIQUE (source, kind, normalized_value);
 
 CREATE TABLE IF NOT EXISTS subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -54,6 +67,8 @@ CREATE TABLE IF NOT EXISTS items (
     x_url TEXT,
     images JSONB NOT NULL DEFAULT '[]'::jsonb,
     video_url TEXT,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
+    video_url_expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
     published_at TIMESTAMPTZ,
     stored_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     is_retweet BOOLEAN NOT NULL DEFAULT FALSE,
@@ -61,13 +76,42 @@ CREATE TABLE IF NOT EXISTS items (
     UNIQUE (target_id, guid)
 );
 
+ALTER TABLE items ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00';
+ALTER TABLE items ADD COLUMN IF NOT EXISTS video_url_expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00';
+
 CREATE INDEX IF NOT EXISTS idx_targets_kind_value ON targets (kind, normalized_value);
+CREATE INDEX IF NOT EXISTS idx_targets_source_kind_value ON targets (source, kind, normalized_value);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_client_id ON subscriptions (client_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_target_id ON subscriptions (target_id);
 CREATE INDEX IF NOT EXISTS idx_items_target_id_stored_at ON items (target_id, stored_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_stored_at ON items (stored_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_published_at ON items (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_video_feed ON items (stored_at DESC) WHERE video_url IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_items_expires_at ON items (expires_at);
+CREATE INDEX IF NOT EXISTS idx_items_video_url_expires_at ON items (video_url_expires_at);
+
+CREATE TABLE IF NOT EXISTS video_resolution_queue (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source TEXT NOT NULL,
+    target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    guid TEXT NOT NULL,
+    provider_video_id TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    resolved_item_id UUID REFERENCES items(id) ON DELETE SET NULL,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT video_resolution_queue_source_check CHECK (source IN ('youtube')),
+    CONSTRAINT video_resolution_queue_status_check CHECK (status IN ('pending', 'failed', 'resolved')),
+    CONSTRAINT video_resolution_queue_unique_target_guid UNIQUE (target_id, guid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_resolution_queue_status_next_expires
+    ON video_resolution_queue (status, next_attempt_at, expires_at);
 
 CREATE TABLE IF NOT EXISTS categories (
     slug TEXT PRIMARY KEY,

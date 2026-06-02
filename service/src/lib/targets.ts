@@ -1,6 +1,8 @@
-export type TargetKind = "user" | "keyword";
+export type TargetSource = "twitter" | "youtube";
+export type TargetKind = "user" | "keyword" | "channel";
 
 export type ParsedTarget = {
+  source: TargetSource;
   kind: TargetKind;
   value: string;
   normalizedValue: string;
@@ -11,11 +13,51 @@ export type ParsedTarget = {
 const MAX_TARGET_TAGS = 12;
 const MAX_TARGET_TAG_LENGTH = 40;
 const MAX_TARGET_CATEGORY_LENGTH = 80;
+const YOUTUBE_CHANNEL_ID_PATTERN = /^UC[A-Za-z0-9_-]{20,}$/;
+
+function normalizeYouTubeChannelID(raw: string) {
+  const value = raw.trim();
+  if (!value) {
+    throw new Error("YouTube channel target cannot be empty.");
+  }
+
+  let channelID = value;
+  try {
+    const url = new URL(value);
+    const host = url.host.toLowerCase();
+    if (host === "youtube.com" || host === "www.youtube.com" || host === "m.youtube.com") {
+      const components = url.pathname.split("/").filter(Boolean);
+      if (components[0]?.toLowerCase() === "channel" && components[1]) {
+        channelID = components[1];
+      }
+    }
+  } catch {
+    if (value.toLowerCase().startsWith("/channel/")) {
+      channelID = value.split("/").filter(Boolean)[1] ?? value;
+    }
+  }
+
+  if (!YOUTUBE_CHANNEL_ID_PATTERN.test(channelID)) {
+    throw new Error("YouTube channel target must be a channel ID or /channel/UC... URL.");
+  }
+  return channelID;
+}
 
 export function parseTarget(raw: string): ParsedTarget {
   const value = raw.trim();
   if (!value) {
     throw new Error("Target cannot be empty.");
+  }
+
+  if (value.toLowerCase().startsWith("youtube:")) {
+    const channelID = normalizeYouTubeChannelID(value.slice("youtube:".length));
+    return {
+      source: "youtube",
+      kind: "channel",
+      value: channelID,
+      normalizedValue: channelID.toLowerCase(),
+      tags: [],
+    };
   }
 
   if (value.startsWith("search:")) {
@@ -24,6 +66,7 @@ export function parseTarget(raw: string): ParsedTarget {
       throw new Error("Keyword target cannot be empty.");
     }
     return {
+      source: "twitter",
       kind: "keyword",
       value: keyword,
       normalizedValue: keyword.toLowerCase(),
@@ -32,6 +75,7 @@ export function parseTarget(raw: string): ParsedTarget {
   }
 
   return {
+    source: "twitter",
     kind: "user",
     value,
     normalizedValue: value.toLowerCase(),
@@ -39,7 +83,10 @@ export function parseTarget(raw: string): ParsedTarget {
   };
 }
 
-export function formatTarget(target: ParsedTarget | { kind: TargetKind; value: string }): string {
+export function formatTarget(target: ParsedTarget | { source?: TargetSource; kind: TargetKind; value: string }): string {
+  if (target.source === "youtube") {
+    return `youtube:${target.value}`;
+  }
   return target.kind === "keyword" ? `search:${target.value}` : target.value;
 }
 
@@ -105,6 +152,82 @@ function normalizeTargetCategory(rawCategory: unknown) {
   return category;
 }
 
+function normalizeTargetSource(rawSource: unknown): TargetSource {
+  if (rawSource === undefined || rawSource === null) {
+    return "twitter";
+  }
+  if (typeof rawSource !== "string") {
+    throw new Error("Target source must be a string.");
+  }
+  const source = rawSource.trim().toLowerCase();
+  if (source === "twitter" || source === "youtube") {
+    return source;
+  }
+  throw new Error("Unsupported target source.");
+}
+
+function normalizeTargetKind(rawKind: unknown, source: TargetSource): TargetKind | null {
+  if (rawKind === undefined || rawKind === null) {
+    return null;
+  }
+  if (typeof rawKind !== "string") {
+    throw new Error("Target kind must be a string.");
+  }
+  const kind = rawKind.trim().toLowerCase();
+  if (source === "youtube") {
+    if (kind === "channel") {
+      return "channel";
+    }
+    throw new Error("YouTube targets must use channel kind.");
+  }
+  if (kind === "user" || kind === "keyword") {
+    return kind;
+  }
+  throw new Error("Twitter targets must use user or keyword kind.");
+}
+
+function parseObjectTarget(candidate: { source?: unknown; kind?: unknown; target?: unknown; category?: unknown; tags?: unknown }) {
+  if (typeof candidate.target !== "string") {
+    throw new Error("Each target object must include a string target.");
+  }
+  if (candidate.category === undefined || candidate.category === null) {
+    throw new Error("Target category is required.");
+  }
+
+  const source = normalizeTargetSource(candidate.source);
+  const explicitKind = normalizeTargetKind(candidate.kind, source);
+  let parsed: ParsedTarget;
+  if (source === "youtube") {
+    const channelID = normalizeYouTubeChannelID(candidate.target);
+    parsed = {
+      source,
+      kind: "channel",
+      value: channelID,
+      normalizedValue: channelID.toLowerCase(),
+      tags: [],
+    };
+  } else if (explicitKind === "keyword") {
+    parsed = parseTarget(candidate.target.toLowerCase().startsWith("search:") ? candidate.target : `search:${candidate.target}`);
+  } else if (explicitKind === "user") {
+    parsed = parseTarget(candidate.target);
+  } else {
+    parsed = parseTarget(candidate.target);
+  }
+
+  if (explicitKind && parsed.kind !== explicitKind) {
+    throw new Error("Target kind does not match target value.");
+  }
+  if (parsed.source !== source) {
+    throw new Error("Target source does not match target value.");
+  }
+
+  return {
+    ...parsed,
+    category: normalizeTargetCategory(candidate.category),
+    tags: normalizeTargetTags(candidate.tags),
+  };
+}
+
 function parseTargetInput(rawTarget: unknown) {
   if (typeof rawTarget === "string") {
     return parseTarget(rawTarget);
@@ -114,19 +237,7 @@ function parseTargetInput(rawTarget: unknown) {
     throw new Error("Each target must be a string or an object.");
   }
 
-  const candidate = rawTarget as { target?: unknown; category?: unknown; tags?: unknown };
-  if (typeof candidate.target !== "string") {
-    throw new Error("Each target object must include a string target.");
-  }
-  if (candidate.category === undefined || candidate.category === null) {
-    throw new Error("Target category is required.");
-  }
-
-  return {
-    ...parseTarget(candidate.target),
-    category: normalizeTargetCategory(candidate.category),
-    tags: normalizeTargetTags(candidate.tags),
-  };
+  return parseObjectTarget(rawTarget as { source?: unknown; kind?: unknown; target?: unknown; category?: unknown; tags?: unknown });
 }
 
 export function parseTargets(rawTargets: unknown): ParsedTarget[] {
@@ -139,7 +250,7 @@ export function parseTargets(rawTargets: unknown): ParsedTarget[] {
 
   for (const rawTarget of rawTargets) {
     const target = parseTargetInput(rawTarget);
-    const key = `${target.kind}:${target.normalizedValue}`;
+    const key = `${target.source}:${target.kind}:${target.normalizedValue}`;
     if (seen.has(key)) {
       continue;
     }

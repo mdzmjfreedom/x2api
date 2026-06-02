@@ -293,6 +293,7 @@ curl -sS "$X2API_BASE/api/subscriptions" \
       "id": "sub-uuid",
       "targetId": "target-uuid",
       "target": "search:特朗普",
+      "source": "twitter",
       "kind": "keyword",
       "value": "特朗普",
       "category": "news",
@@ -303,6 +304,7 @@ curl -sS "$X2API_BASE/api/subscriptions" \
       "id": "sub-uuid-2",
       "targetId": "target-uuid-2",
       "target": "elonmusk",
+      "source": "twitter",
       "kind": "user",
       "value": "elonmusk",
       "category": null,
@@ -335,9 +337,11 @@ curl -sS "$X2API_BASE/api/subscriptions" \
       "tags": ["AI", "编程", "Claude Code"]
     },
     {
-      "target": "elonmusk",
-      "category": "business",
-      "tags": ["Tesla", "SpaceX"]
+      "source": "youtube",
+      "kind": "channel",
+      "target": "UCE_M8A5yxnLfW0KghEeajjw",
+      "category": "tech",
+      "tags": ["YouTube"]
     }
   ]
 }
@@ -349,7 +353,7 @@ curl -sS "$X2API_BASE/api/subscriptions" \
 curl -sS -X PUT "$X2API_BASE/api/subscriptions" \
   -H "Authorization: Bearer $X2API_KEY" \
   -H "Content-Type: application/json" \
-  --data '{"targets":[{"target":"search:特朗普","category":"news","tags":["特朗普","美国政治"]},{"target":"elonmusk","category":"business","tags":["Tesla","SpaceX"]}]}'
+  --data '{"targets":[{"target":"search:特朗普","category":"news","tags":["特朗普","美国政治"]},{"source":"youtube","kind":"channel","target":"UCE_M8A5yxnLfW0KghEeajjw","category":"tech","tags":["YouTube"]}]}'
 ```
 
 #### 成功响应
@@ -363,6 +367,7 @@ curl -sS -X PUT "$X2API_BASE/api/subscriptions" \
       "id": "sub-uuid",
       "targetId": "target-uuid",
       "target": "search:特朗普",
+      "source": "twitter",
       "kind": "keyword",
       "value": "特朗普",
       "category": "news",
@@ -378,7 +383,9 @@ curl -sS -X PUT "$X2API_BASE/api/subscriptions" \
 - 如果传空数组，会清空当前订阅
 - 服务端会自动去重
 - 新对象格式中 `category` 必填，使用 `/api/videos/categories` 返回的 `slug`，也兼容分类中文名
-- `target` 支持 `"search:关键词"` 和用户名
+- `source` 支持 `twitter` 和 `youtube`；旧字符串目标默认按 `twitter` 解析
+- `kind` 支持 `user`、`keyword`、`channel`；`youtube` 目前只支持 `channel`
+- `target` 支持 `"search:关键词"`、用户名、`"youtube:UC..."`；对象格式下 YouTube channel 推荐传纯 `UC...` channel ID
 - `tags` 是用户自由输入标签，服务端会 trim、去重，并限制单个目标最多 12 个标签
 - 为兼容脚本和旧调用，`targets` 里仍可传字符串，例如 `"search:AI safety"`；字符串格式不会写入分类和标签
 
@@ -544,6 +551,7 @@ curl -sS "$X2API_BASE/api/items?limit=10&cursor=eyJ2IjoxLCJwYXlsb2FkIjp7Li4ufX0"
     {
       "id": "item-uuid",
       "target": "search:特朗普",
+      "source": "twitter",
       "kind": "keyword",
       "category": "news",
       "isSensitive": false,
@@ -560,6 +568,8 @@ curl -sS "$X2API_BASE/api/items?limit=10&cursor=eyJ2IjoxLCJwYXlsb2FkIjp7Li4ufX0"
         "https://image.example/1.jpg"
       ],
       "videoUrl": null,
+      "expiresAt": "2099-12-31T23:59:59.000Z",
+      "videoUrlExpiresAt": "2099-12-31T23:59:59.000Z",
       "publishedAt": "2026-05-18T14:20:00.000Z",
       "storedAt": "2026-05-18T14:21:10.000Z",
       "guid": "1891234567890123456",
@@ -579,7 +589,9 @@ curl -sS "$X2API_BASE/api/items?limit=10&cursor=eyJ2IjoxLCJwYXlsb2FkIjp7Li4ufX0"
 - `target`
   - 当前命中的订阅目标
 - `kind`
-  - `user` 或 `keyword`
+  - `user`、`keyword` 或 `channel`
+- `source`
+  - `twitter` 或 `youtube`
 - `category`
   - 目标分类 slug，来自 `target_profiles.category`
 - `isSensitive`
@@ -604,6 +616,10 @@ curl -sS "$X2API_BASE/api/items?limit=10&cursor=eyJ2IjoxLCJwYXlsb2FkIjp7Li4ufX0"
   - 图片 URL 数组
 - `videoUrl`
   - 视频 URL
+- `expiresAt`
+  - 记录业务保留期限；YouTube item 通常为发布时间后 72 小时，Twitter 默认为长期有效
+- `videoUrlExpiresAt`
+  - 播放 URL 过期时间；客户端可用它判断当前播放链接是否需要友好跳过
 - `publishedAt`
   - 原始发布时间
 - `storedAt`
@@ -857,7 +873,10 @@ Authorization: Bearer x2d_xxx
   "items": [
     {
       "id": "item_uuid",
+      "videoKey": "https://video.twimg.com/ext_tw_video/.../vid/avc1/720x1280/video.mp4",
       "videoUrl": "https://video.twimg.com/...",
+      "videoUrlExpiresAt": "2099-12-31T23:59:59.000Z",
+      "expiresAt": "2099-12-31T23:59:59.000Z",
       "coverUrl": "https://pbs.twimg.com/...",
       "title": "...",
       "caption": "...",
@@ -867,6 +886,7 @@ Authorization: Bearer x2d_xxx
       "link": "https://nitter...",
       "publishedAt": "2026-05-21T00:00:00.000Z",
       "storedAt": "2026-05-21T00:01:00.000Z",
+      "source": "twitter",
       "target": "search:AI video",
       "kind": "keyword",
       "category": "tech",
@@ -890,6 +910,12 @@ Authorization: Bearer x2d_xxx
   }
 }
 ```
+
+说明：
+
+- `videoKey` 是稳定视频身份。YouTube 使用 `youtube:<videoId>`，客户端应用它做缓存、去重和已看状态，不应使用会刷新的 `videoUrl` 做身份。
+- `expiresAt` 是业务数据保留期限；`videoUrlExpiresAt` 是播放 URL 过期时间。
+- YouTube 视频只有 `expiresAt > now` 且 `videoUrlExpiresAt > now + 10 minutes` 时才会返回；客户端如果回到已过期的旧数据，应提示并自动跳过。
 
 ### 12.3 `POST /api/videos/events`
 
@@ -1039,3 +1065,10 @@ DATABASE_URL=... python3 scripts/cleanup_video_feed_data.py \
   --low-score-threshold -5 \
   --high-score-threshold 20
 ```
+
+## 13. YouTube Collector 命令
+
+- `python collector/twitter_monitor.py monitor` 只抓取 Twitter/X 目标，不处理 YouTube，避免 YouTube resolver 影响 Twitter 抓取。
+- `python collector/twitter_monitor.py monitor-youtube` 单独抓取 `source = youtube` 的 channel RSS，并将 72 小时内的新视频写入解析队列。
+- `python collector/twitter_monitor.py refresh-youtube-playback-urls --limit 30 --refresh-window-minutes 90 --critical-window-minutes 15` 单独刷新即将过期的 YouTube 播放 URL 并补处理未解析队列。
+- 对应 workflow：`youtube-monitor.yml` 负责 RSS 抓取，`youtube-playback-refresh.yml` 负责播放 URL 保鲜；当前两者都配置为每 10 分钟运行一次，也支持手动 `workflow_dispatch`。

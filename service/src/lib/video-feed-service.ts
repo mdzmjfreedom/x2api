@@ -28,10 +28,14 @@ export type VideoFeedItem = {
   link: string | null;
   publishedAt: string | null;
   storedAt: string;
+  source: "twitter" | "youtube";
   target: string;
-  kind: "user" | "keyword";
+  kind: "user" | "keyword" | "channel";
   category: string | null;
   tags: string[];
+  videoKey: string;
+  expiresAt: string;
+  videoUrlExpiresAt: string;
   stats: {
     impressions: number;
     plays: number;
@@ -264,6 +268,8 @@ function videoKeyExpression(alias: "i" | "watched_item"): QueryChunk {
   return {
     text: `
     CASE
+      WHEN ${alias}.metadata->>'youtube_video_id' IS NOT NULL THEN 'youtube:' || (${alias}.metadata->>'youtube_video_id')
+      WHEN ${alias}.guid LIKE 'yt:video:%' THEN 'youtube:' || replace(${alias}.guid, 'yt:video:', '')
       WHEN ${alias}.video_url LIKE 'https://video.twimg.com/%' THEN split_part(${alias}.video_url, '?', 1)
       ELSE ${alias}.video_url
     END
@@ -353,13 +359,17 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         i.link,
         i.published_at AS "publishedAt",
         i.stored_at AS "storedAt",
+        t.source,
         COALESCE(i.published_at, i.stored_at) AS "sortTime",
         CASE
+          WHEN t.source = 'youtube' THEN 'youtube:' || t.value
           WHEN t.kind = 'keyword' THEN 'search:' || t.value
           ELSE t.value
         END AS target,
         t.kind,
         tp.category,
+        i.expires_at AS "expiresAt",
+        i.video_url_expires_at AS "videoUrlExpiresAt",
         COALESCE(vs.impressions, 0) AS impressions,
         COALESCE(vs.plays, 0) AS plays,
         COALESCE(vs.finishes, 0) AS finishes,
@@ -378,6 +388,11 @@ export async function listVideoFeed(query: VideoFeedQuery) {
       LEFT JOIN video_stats vs ON vs.item_id = i.id
       WHERE i.video_url IS NOT NULL
         AND i.video_url <> ''
+        AND i.expires_at > NOW()
+        AND (
+          t.source <> 'youtube'
+          OR i.video_url_expires_at > NOW() + INTERVAL '10 minutes'
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM jsonb_array_elements_text(${JSON.stringify(seenIds)}::jsonb) AS seen_item(id)
@@ -494,10 +509,13 @@ export async function listVideoFeed(query: VideoFeedQuery) {
       ci.link,
       ci."publishedAt",
       ci."storedAt",
+      ci.source,
       ci."sortTime",
       ci.target,
       ci.kind,
       ci.category,
+      ci."expiresAt",
+      ci."videoUrlExpiresAt",
       COALESCE((
         SELECT ARRAY_AGG(DISTINCT tag_name ORDER BY tag_name)
         FROM (
@@ -604,7 +622,7 @@ export async function listVideoFeed(query: VideoFeedQuery) {
       : null;
 
   return {
-    items: items.map(({ guid: _guid, videoKey: _videoKey, sortTime: _sortTime, ...item }) => item),
+    items: items.map(({ guid: _guid, sortTime: _sortTime, ...item }) => item),
     pagination: {
       limit,
       nextCursor,
@@ -631,6 +649,11 @@ export async function recordVideoEvent(input: {
     WHERE i.id = ${input.itemId}
       AND i.video_url IS NOT NULL
       AND i.video_url <> ''
+      AND i.expires_at > NOW()
+      AND (
+        NOT EXISTS (SELECT 1 FROM targets t WHERE t.id = i.target_id AND t.source = 'youtube')
+        OR i.video_url_expires_at > NOW()
+      )
   `;
 
   await sql`
@@ -669,6 +692,11 @@ export async function recordVideoEvent(input: {
     WHERE i.id = ${input.itemId}
       AND i.video_url IS NOT NULL
       AND i.video_url <> ''
+      AND i.expires_at > NOW()
+      AND (
+        NOT EXISTS (SELECT 1 FROM targets t WHERE t.id = i.target_id AND t.source = 'youtube')
+        OR i.video_url_expires_at > NOW()
+      )
     ON CONFLICT (item_id) DO UPDATE SET
       impressions = video_stats.impressions + EXCLUDED.impressions,
       plays = video_stats.plays + EXCLUDED.plays,

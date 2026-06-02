@@ -27,7 +27,8 @@ export type ListItemsResult = {
 export type ItemRecord = {
   id: string;
   target: string;
-  kind: "user" | "keyword";
+  source: "twitter" | "youtube";
+  kind: "user" | "keyword" | "channel";
   category: string | null;
   isSensitive: boolean;
   tags: string[];
@@ -41,6 +42,8 @@ export type ItemRecord = {
   xUrl: string | null;
   images: string[];
   videoUrl: string | null;
+  expiresAt: string;
+  videoUrlExpiresAt: string;
   publishedAt: string | null;
   storedAt: string;
   guid: string;
@@ -102,9 +105,11 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
     SELECT
       i.id,
       CASE
+        WHEN t.source = 'youtube' THEN 'youtube:' || t.value
         WHEN t.kind = 'keyword' THEN 'search:' || t.value
         ELSE t.value
       END AS target,
+      t.source,
       t.kind,
       tp.category,
       COALESCE(cat.is_sensitive, FALSE) AS "isSensitive",
@@ -132,6 +137,8 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
         SELECT jsonb_array_elements_text(i.images)
       ) AS images,
       i.video_url AS "videoUrl",
+      i.expires_at AS "expiresAt",
+      i.video_url_expires_at AS "videoUrlExpiresAt",
       i.published_at AS "publishedAt",
       i.stored_at AS "storedAt",
       COALESCE(i.published_at, i.stored_at) AS "sortTime",
@@ -148,6 +155,13 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
     LEFT JOIN categories cat ON cat.slug = tp.category
     WHERE s.client_id = ${query.clientId}
       AND (
+        i.expires_at > NOW()
+      )
+      AND (
+        t.source <> 'youtube'
+        OR i.video_url_expires_at > NOW() + INTERVAL '10 minutes'
+      )
+      AND (
         ${searchText}::text IS NULL
         OR LOWER(COALESCE(i.content, '')) LIKE ${searchText}
         OR LOWER(COALESCE(i.raw_content, '')) LIKE ${searchText}
@@ -158,6 +172,7 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
         ${targetFilter}::text IS NULL
         OR LOWER(
           CASE
+            WHEN t.source = 'youtube' THEN 'youtube:' || t.value
             WHEN t.kind = 'keyword' THEN 'search:' || t.value
             ELSE t.value
           END
@@ -225,6 +240,7 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
       id,
       target,
       kind,
+      source,
       category,
       "isSensitive",
       tags,
@@ -238,6 +254,8 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
       "xUrl",
       images,
       "videoUrl",
+      "expiresAt",
+      "videoUrlExpiresAt",
       "publishedAt",
       "storedAt",
       "sortTime",
@@ -291,9 +309,11 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
       SELECT
         i.id,
         CASE
+          WHEN t.source = 'youtube' THEN 'youtube:' || t.value
           WHEN t.kind = 'keyword' THEN 'search:' || t.value
           ELSE t.value
         END AS target,
+        t.source,
         t.kind,
         tp.category,
         COALESCE(cat.is_sensitive, FALSE) AS "isSensitive",
@@ -321,6 +341,8 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
           SELECT jsonb_array_elements_text(i.images)
         ) AS images,
         i.video_url AS "videoUrl",
+        i.expires_at AS "expiresAt",
+        i.video_url_expires_at AS "videoUrlExpiresAt",
         i.published_at AS "publishedAt",
         i.stored_at AS "storedAt",
         COALESCE(i.published_at, i.stored_at) AS "sortTime",
@@ -338,6 +360,11 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
       LEFT JOIN categories cat ON cat.slug = tp.category
       WHERE c.feed_token = ${feedToken}
         AND c.status = 'active'
+        AND i.expires_at > NOW()
+        AND (
+          t.source <> 'youtube'
+          OR i.video_url_expires_at > NOW() + INTERVAL '10 minutes'
+        )
     ),
     deduped_items AS (
       SELECT *
@@ -347,6 +374,7 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
     SELECT
       id,
       target,
+      source,
       kind,
       category,
       "isSensitive",
@@ -361,6 +389,8 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
       "xUrl",
       images,
       "videoUrl",
+      "expiresAt",
+      "videoUrlExpiresAt",
       "publishedAt",
       "storedAt",
       guid,

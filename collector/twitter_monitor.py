@@ -10,7 +10,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -29,6 +29,9 @@ DEFAULT_RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 DEFAULT_MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "100000"))
 AUTO_TRANSLATE = os.environ.get("TRANSLATE_CONTENT", "false").lower() == "true"
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "").strip()
+YOUTUBE_RETENTION_HOURS = 72
+YOUTUBE_RSS_TIMEOUT_SECONDS = 20
+YOUTUBE_PLAYBACK_RESOLVER_TIMEOUT_SECONDS = 30
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 VIDEO_THUMB_PREFIXES = (
@@ -136,11 +139,21 @@ def parse_targets(raw: str | list[str] | None) -> list[str]:
 
 def parse_target_value(target: str) -> dict[str, str]:
     normalized = normalize_target(target)
+    if normalized.lower().startswith("youtube:"):
+        channel_id = normalize_youtube_channel_id(normalized[8:].strip())
+        return {
+            "source": "youtube",
+            "kind": "channel",
+            "value": channel_id,
+            "normalized_value": channel_id.lower(),
+        }
+
     if normalized.startswith("search:"):
         keyword = normalized[7:].strip()
         if not keyword:
             raise ValueError("Keyword target cannot be empty.")
         return {
+            "source": "twitter",
             "kind": "keyword",
             "value": keyword,
             "normalized_value": keyword.lower(),
@@ -150,6 +163,7 @@ def parse_target_value(target: str) -> dict[str, str]:
         raise ValueError("Target cannot be empty.")
 
     return {
+        "source": "twitter",
         "kind": "user",
         "value": normalized,
         "normalized_value": normalized.lower(),
@@ -158,6 +172,31 @@ def parse_target_value(target: str) -> dict[str, str]:
 
 def format_target(kind: str, value: str) -> str:
     return f"search:{value}" if kind == "keyword" else value
+
+
+def format_target_row(target_row: dict) -> str:
+    if target_row.get("source") == "youtube":
+        return f"youtube:{target_row['value']}"
+    return format_target(target_row["kind"], target_row["value"])
+
+
+def normalize_youtube_channel_id(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("YouTube channel target cannot be empty.")
+    channel_id = value
+    parsed = urlparse(value)
+    if parsed.netloc.lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0].lower() == "channel":
+            channel_id = parts[1]
+    elif value.lower().startswith("/channel/"):
+        parts = [part for part in value.split("/") if part]
+        if len(parts) >= 2:
+            channel_id = parts[1]
+    if not re.fullmatch(r"UC[A-Za-z0-9_-]{20,}", channel_id):
+        raise ValueError("YouTube channel target must be a channel ID or /channel/UC... URL.")
+    return channel_id
 
 
 def create_opaque_token(prefix: str) -> str:
@@ -231,7 +270,7 @@ def select_targets_for_shard(target_rows: list[dict], shard_index: int, shard_co
 
     selected_targets: list[dict] = []
     for target_row in target_rows:
-        target_key = format_target(target_row["kind"], target_row["value"]).lower()
+        target_key = format_target_row(target_row).lower()
         digest = hashlib.sha256(target_key.encode("utf-8")).hexdigest()
         bucket = int(digest[:8], 16) % shard_count
         if bucket == shard_index:
@@ -618,40 +657,47 @@ def upsert_target(conn, target: str) -> dict:
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO targets (kind, value, normalized_value)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (kind, normalized_value)
+            INSERT INTO targets (source, kind, value, normalized_value)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (source, kind, normalized_value)
             DO UPDATE SET value = EXCLUDED.value
-            RETURNING id, kind, value, normalized_value
+            RETURNING id, source, kind, value, normalized_value
             """,
-            (parsed["kind"], parsed["value"], parsed["normalized_value"]),
+            (parsed["source"], parsed["kind"], parsed["value"], parsed["normalized_value"]),
         )
         return cur.fetchone()
 
 
-def load_active_targets(conn) -> list[dict]:
+def load_active_targets(conn, source: str = "twitter") -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT
                 t.id,
+                t.source,
                 t.kind,
                 t.value,
                 t.normalized_value,
                 cs.last_guid
             FROM targets t
             LEFT JOIN crawl_state cs ON cs.target_id = t.id
-            WHERE EXISTS (
+            WHERE t.source = %s
+              AND EXISTS (
                 SELECT 1
                 FROM subscriptions s
                 INNER JOIN clients c ON c.id = s.client_id
                 WHERE s.target_id = t.id
                   AND c.status = 'active'
             )
-            ORDER BY t.kind, LOWER(t.value)
-            """
+            ORDER BY t.source, t.kind, LOWER(t.value)
+            """,
+            (source,),
         )
         return cur.fetchall()
+
+
+def load_youtube_targets(conn) -> list[dict]:
+    return load_active_targets(conn, "youtube")
 
 
 def resolve_client(conn, api_key: str) -> dict | None:
@@ -672,16 +718,16 @@ def list_subscriptions(conn, client_id: str) -> list[str]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT t.kind, t.value
+            SELECT t.source, t.kind, t.value
             FROM subscriptions s
             INNER JOIN targets t ON t.id = s.target_id
             WHERE s.client_id = %s
-            ORDER BY t.kind, LOWER(t.value)
+            ORDER BY t.source, t.kind, LOWER(t.value)
             """,
             (client_id,),
         )
         rows = cur.fetchall()
-    return [format_target(row["kind"], row["value"]) for row in rows]
+    return [format_target_row(row) for row in rows]
 
 
 def replace_subscriptions(conn, client_id: str, targets: list[str]) -> None:
@@ -724,10 +770,10 @@ def remove_subscriptions(conn, client_id: str, targets: list[str]) -> None:
                   AND target_id IN (
                     SELECT id
                     FROM targets
-                    WHERE kind = %s AND normalized_value = %s
+                    WHERE source = %s AND kind = %s AND normalized_value = %s
                   )
                 """,
-                (client_id, parsed["kind"], parsed["normalized_value"]),
+                (client_id, parsed["source"], parsed["kind"], parsed["normalized_value"]),
             )
 
 
@@ -805,6 +851,7 @@ def load_system_targets(conn) -> list[dict]:
             """
             SELECT
                 t.id,
+                t.source,
                 t.kind,
                 t.value,
                 t.normalized_value,
@@ -812,9 +859,10 @@ def load_system_targets(conn) -> list[dict]:
             FROM targets t
             INNER JOIN target_profiles tp ON tp.target_id = t.id
             LEFT JOIN crawl_state cs ON cs.target_id = t.id
-            WHERE tp.scope = 'system'
+            WHERE t.source = 'twitter'
+              AND tp.scope = 'system'
               AND tp.is_public_pool = TRUE
-            ORDER BY tp.weight DESC, t.kind, LOWER(t.value)
+            ORDER BY tp.weight DESC, t.source, t.kind, LOWER(t.value)
             """
         )
         return cur.fetchall()
@@ -929,12 +977,498 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
     return inserted
 
 
+def youtube_entry_value(entry: dict, *keys: str) -> str | None:
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_youtube_video_id(entry: dict) -> str | None:
+    direct = youtube_entry_value(entry, "yt_videoid", "yt:videoId", "videoId")
+    if direct:
+        return direct
+    entry_id = youtube_entry_value(entry, "id", "guid")
+    if entry_id and entry_id.startswith("yt:video:"):
+        return entry_id.removeprefix("yt:video:")
+    link = youtube_entry_value(entry, "link")
+    if link:
+        parsed = urlparse(link)
+        query_video_id = parse_qs(parsed.query).get("v", [None])[0]
+        if query_video_id:
+            return query_video_id
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "shorts":
+            return parts[1]
+    media_content = entry.get("media_content") or []
+    if isinstance(media_content, list):
+        for media in media_content:
+            if isinstance(media, dict):
+                url = media.get("url")
+                if isinstance(url, str):
+                    parsed = urlparse(url)
+                    query_video_id = parse_qs(parsed.query).get("v", [None])[0]
+                    if query_video_id:
+                        return query_video_id
+    return None
+
+
+def extract_youtube_thumbnail(entry: dict, video_id: str) -> str:
+    thumbnails = entry.get("media_thumbnail") or []
+    if isinstance(thumbnails, list):
+        for thumbnail in thumbnails:
+            if isinstance(thumbnail, dict):
+                url = thumbnail.get("url")
+                if isinstance(url, str) and url.strip():
+                    return url.strip()
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def make_youtube_queue_payload(target_row: dict, entry: dict, fetched_at: datetime) -> dict | None:
+    video_id = extract_youtube_video_id(entry)
+    if not video_id:
+        return None
+    published_at = parse_datetime(youtube_entry_value(entry, "published", "updated")) or fetched_at
+    if published_at < fetched_at - timedelta(hours=YOUTUBE_RETENTION_HOURS):
+        return None
+    guid = f"yt:video:{video_id}"
+    link = youtube_entry_value(entry, "link") or f"https://www.youtube.com/watch?v={video_id}"
+    title = youtube_entry_value(entry, "title", "media_title") or "YouTube video"
+    description = youtube_entry_value(entry, "media_description", "summary", "description") or ""
+    author = youtube_entry_value(entry, "author", "name") or target_row["value"]
+    thumbnail = extract_youtube_thumbnail(entry, video_id)
+    expires_at = published_at + timedelta(hours=YOUTUBE_RETENTION_HOURS)
+    return {
+        "source": "youtube",
+        "target_id": target_row["id"],
+        "channel_id": target_row["value"],
+        "guid": guid,
+        "provider_video_id": video_id,
+        "title": title,
+        "content": description,
+        "raw_content": description,
+        "author": author,
+        "fullname": author,
+        "link": link,
+        "x_url": None,
+        "images": [thumbnail],
+        "video_poster_url": thumbnail,
+        "published_at": published_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+def enqueue_youtube_payload(conn, payload: dict) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO video_resolution_queue (
+                source, target_id, guid, provider_video_id, payload, status, attempts, next_attempt_at, expires_at
+            )
+            VALUES ('youtube', %s, %s, %s, %s, 'pending', 0, NOW(), %s)
+            ON CONFLICT (target_id, guid) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                next_attempt_at = LEAST(video_resolution_queue.next_attempt_at, NOW()),
+                expires_at = EXCLUDED.expires_at,
+                updated_at = NOW()
+            RETURNING (xmax = 0) AS inserted
+            """,
+            (payload["target_id"], payload["guid"], payload["provider_video_id"], Jsonb(payload), parse_datetime(payload["expires_at"])),
+        )
+        row = cur.fetchone()
+        return bool(row and row.get("inserted"))
+
+
+def item_exists_for_guid(conn, target_id: str, guid: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM items WHERE target_id = %s AND guid = %s LIMIT 1", (target_id, guid))
+        return cur.fetchone() is not None
+
+
+def collect_media_candidates(value) -> list[dict]:
+    candidates: list[dict] = []
+    if isinstance(value, dict):
+        if isinstance(value.get("url"), str):
+            candidates.append(value)
+        for child in value.values():
+            candidates.extend(collect_media_candidates(child))
+    elif isinstance(value, list):
+        for child in value:
+            candidates.extend(collect_media_candidates(child))
+    return candidates
+
+
+def parse_url_expire(video_url: str) -> datetime | None:
+    expire_value = parse_qs(urlparse(video_url).query).get("expire", [None])[0]
+    if not expire_value:
+        return None
+    try:
+        return datetime.fromtimestamp(int(expire_value), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def youtube_resolver_url_variants(watch_url: str) -> list[str]:
+    variants = [watch_url]
+    parsed = urlparse(watch_url)
+    video_id = parse_qs(parsed.query).get("v", [None])[0]
+    parts = [part for part in parsed.path.split("/") if part]
+    if not video_id and len(parts) >= 2 and parts[0] in {"shorts", "v"}:
+        video_id = parts[1]
+    if not video_id and parsed.netloc.lower() == "youtu.be" and parts:
+        video_id = parts[0]
+    if video_id:
+        variants.extend(
+            [
+                f"https://www.youtube.com/v/{video_id}?version=3",
+                f"https://www.youtube.com/watch?v={video_id}",
+                f"https://youtu.be/{video_id}",
+            ]
+        )
+    seen: set[str] = set()
+    return [url for url in variants if url and not (url in seen or seen.add(url))]
+
+
+def fetch_youtube_resolver_payload(resolver_url: str) -> dict:
+    response = requests.post(
+        "https://www.clipto.com/api/youtube",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://www.clipto.com",
+            "Referer": "https://www.clipto.com/zh-TW/media-downloader/youtube-downloader?via=ytb",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+        },
+        json={"url": resolver_url},
+        timeout=YOUTUBE_PLAYBACK_RESOLVER_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def resolve_youtube_playback_url(watch_url: str) -> dict:
+    errors: list[str] = []
+    payload = None
+    candidates: list[dict] = []
+    for resolver_url in youtube_resolver_url_variants(watch_url):
+        try:
+            payload = fetch_youtube_resolver_payload(resolver_url)
+            candidates = collect_media_candidates(payload)
+            if candidates:
+                break
+            errors.append(f"{resolver_url}: empty media list")
+        except Exception as exc:
+            errors.append(f"{resolver_url}: {exc}")
+    if payload is None:
+        raise RuntimeError("; ".join(errors) or "YouTube resolver returned no payload.")
+    progressive = []
+    for candidate in candidates:
+        url = candidate.get("url")
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        format_id = str(candidate.get("formatId") or candidate.get("format_id") or candidate.get("itag") or "")
+        mime = str(candidate.get("mimeType") or candidate.get("mime") or candidate.get("type") or "").lower()
+        quality = str(candidate.get("quality") or candidate.get("qualityLabel") or "")
+        has_audio = candidate.get("hasAudio") is True or candidate.get("audio") is not False or "audio" in mime
+        video_only = candidate.get("hasAudio") is False or "video/webm" in mime and "audio" not in mime
+        if format_id == "18" or (("mp4" in mime or ".mp4" in url) and has_audio and not video_only):
+            progressive.append((0 if format_id == "18" else 1, quality, candidate))
+    if not progressive:
+        raise RuntimeError("No progressive MP4 candidate returned by YouTube resolver. " + "; ".join(errors))
+    progressive.sort(key=lambda item: (item[0], item[1]))
+    selected = progressive[0][2]
+    video_url = selected["url"]
+    expires_at = parse_url_expire(video_url)
+    if not expires_at:
+        raise RuntimeError("Resolved YouTube playback URL does not include an expire query parameter.")
+    return {
+        "video_url": video_url,
+        "video_url_expires_at": expires_at,
+        "format_id": str(selected.get("formatId") or selected.get("format_id") or selected.get("itag") or ""),
+        "duration_seconds": selected.get("duration") or selected.get("durationSeconds"),
+        "raw": payload,
+    }
+
+
+def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
+    payload = queue_row["payload"] or {}
+    metadata = {
+        "target": f"youtube:{payload['channel_id']}",
+        "target_type": "channel",
+        "target_value": payload["channel_id"],
+        "youtube_video_id": payload["provider_video_id"],
+        "youtube_channel_id": payload["channel_id"],
+        "watch_url": payload["link"],
+        "resolver": "clipto",
+        "resolved_at": now_iso(),
+        "format_id": resolved.get("format_id"),
+        "duration_seconds": resolved.get("duration_seconds"),
+        "video_poster_url": payload.get("video_poster_url"),
+        "video_url_expires_at": resolved["video_url_expires_at"].isoformat(),
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO items (
+                target_id, guid, author, fullname, title, content, raw_content, translated_content,
+                link, x_url, images, video_url, expires_at, video_url_expires_at,
+                published_at, stored_at, is_retweet, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            ON CONFLICT (target_id, guid) DO UPDATE SET
+                video_url = EXCLUDED.video_url,
+                video_url_expires_at = EXCLUDED.video_url_expires_at,
+                expires_at = EXCLUDED.expires_at,
+                metadata = items.metadata || EXCLUDED.metadata
+            RETURNING id
+            """,
+            (
+                queue_row["target_id"],
+                payload["guid"],
+                payload.get("author"),
+                payload.get("fullname"),
+                payload.get("title"),
+                payload.get("content"),
+                payload.get("raw_content"),
+                payload.get("link"),
+                Jsonb(payload.get("images") or []),
+                resolved["video_url"],
+                parse_datetime(payload["expires_at"]),
+                resolved["video_url_expires_at"],
+                parse_datetime(payload["published_at"]),
+                Jsonb(metadata),
+            ),
+        )
+        return str(cur.fetchone()["id"])
+
+
+def resolve_youtube_queue_row(conn, queue_row: dict) -> bool:
+    payload = queue_row["payload"] or {}
+    try:
+        resolved = resolve_youtube_playback_url(payload["link"])
+        item_id = upsert_resolved_youtube_item(conn, queue_row, resolved)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE video_resolution_queue
+                SET status = 'resolved', attempts = attempts + 1, last_error = NULL,
+                    resolved_item_id = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (item_id, queue_row["id"]),
+            )
+        return True
+    except Exception as exc:
+        attempts = int(queue_row.get("attempts") or 0) + 1
+        delay_minutes = min(180, 5 * (2 ** min(attempts, 5)))
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE video_resolution_queue
+                SET status = 'failed', attempts = attempts + 1, last_error = %s,
+                    next_attempt_at = NOW() + (%s || ' minutes')::interval,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (str(exc)[:500], delay_minutes, queue_row["id"]),
+            )
+        print(f"[YouTube] resolve failed for {payload.get('guid')}: {exc}")
+        return False
+
+
+def fetch_youtube_rss_entries(channel_id: str) -> list[dict]:
+    import feedparser
+
+    url = "https://www.youtube.com/feeds/videos.xml?" + urlencode({"channel_id": channel_id})
+    response = requests.get(
+        url,
+        headers={"User-Agent": "x2api-youtube-rss/1.0"},
+        timeout=YOUTUBE_RSS_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    parsed = feedparser.parse(response.content)
+    if parsed.bozo:
+        raise RuntimeError(f"YouTube RSS parse failed: {parsed.bozo_exception}")
+    return [dict(entry) for entry in parsed.entries]
+
+
+def monitor_youtube_target(conn, target_row: dict) -> int:
+    fetched_at = now_utc()
+    entries = fetch_youtube_rss_entries(target_row["value"])
+    if not entries:
+        upsert_crawl_state(conn, target_row["id"], last_guid=target_row.get("last_guid"), last_error="No YouTube RSS entries returned.", success=False)
+        return 0
+    latest_guid: str | None = None
+    queued = 0
+    for entry in entries:
+        payload = make_youtube_queue_payload(target_row, entry, fetched_at)
+        if payload is None:
+            continue
+        latest_guid = latest_guid or payload["guid"]
+        if target_row.get("last_guid") == payload["guid"]:
+            break
+        if item_exists_for_guid(conn, target_row["id"], payload["guid"]):
+            continue
+        if enqueue_youtube_payload(conn, payload):
+            queued += 1
+    conn.commit()
+
+    resolved_count = 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM video_resolution_queue
+            WHERE target_id = %s
+              AND status IN ('pending', 'failed')
+              AND next_attempt_at <= NOW()
+              AND expires_at > NOW()
+            ORDER BY attempts ASC, payload->>'published_at' DESC
+            LIMIT 5
+            """,
+            (target_row["id"],),
+        )
+        rows = cur.fetchall()
+    for row in rows:
+        if resolve_youtube_queue_row(conn, row):
+            resolved_count += 1
+        conn.commit()
+
+    upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid or target_row.get("last_guid"), last_error=None, success=True)
+    return resolved_count
+
+
+def refresh_youtube_playback_urls(conn, limit: int, refresh_window_minutes: int, critical_window_minutes: int) -> dict[str, int]:
+    processed = 0
+    resolved = 0
+    refreshed = 0
+
+    def remaining() -> int:
+        return max(0, limit - processed)
+
+    def fetch_queue_rows(where_sql: str, params: tuple = ()) -> list[dict]:
+        if remaining() <= 0:
+            return []
+        with conn.cursor() as cur:
+            cur.execute(where_sql, (*params, remaining()))
+            return cur.fetchall()
+
+    def refresh_item(row: dict) -> bool:
+        payload = {
+            "guid": row["guid"],
+            "provider_video_id": row["metadata"].get("youtube_video_id"),
+            "channel_id": row["metadata"].get("youtube_channel_id"),
+            "link": row["metadata"].get("watch_url") or row["link"],
+            "expires_at": row["expires_at"].isoformat(),
+            "published_at": row["published_at"].isoformat() if row.get("published_at") else row["stored_at"].isoformat(),
+            "title": row.get("title"),
+            "content": row.get("content"),
+            "raw_content": row.get("raw_content"),
+            "author": row.get("author"),
+            "fullname": row.get("fullname"),
+            "images": row.get("images") or [],
+            "video_poster_url": row["metadata"].get("video_poster_url"),
+        }
+        try:
+            resolved_payload = resolve_youtube_playback_url(payload["link"])
+            metadata = row["metadata"] | {
+                "resolver": "clipto",
+                "resolved_at": now_iso(),
+                "format_id": resolved_payload.get("format_id"),
+                "duration_seconds": resolved_payload.get("duration_seconds"),
+                "video_url_expires_at": resolved_payload["video_url_expires_at"].isoformat(),
+            }
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE items
+                    SET video_url = %s, video_url_expires_at = %s, metadata = %s, stored_at = stored_at
+                    WHERE id = %s
+                    """,
+                    (resolved_payload["video_url"], resolved_payload["video_url_expires_at"], Jsonb(metadata), row["id"]),
+                )
+            return True
+        except Exception as exc:
+            print(f"[YouTube] refresh failed for {row['guid']}: {exc}")
+            return False
+
+    item_queries = [
+        (
+            """
+            SELECT i.*, t.value AS channel_id
+            FROM items i INNER JOIN targets t ON t.id = i.target_id
+            WHERE t.source = 'youtube' AND i.expires_at > NOW()
+              AND i.video_url_expires_at <= NOW() + (%s || ' minutes')::interval
+            ORDER BY i.video_url_expires_at ASC
+            LIMIT %s
+            """,
+            (critical_window_minutes,),
+        ),
+        (
+            """
+            SELECT i.*, t.value AS channel_id
+            FROM items i INNER JOIN targets t ON t.id = i.target_id
+            WHERE t.source = 'youtube' AND i.expires_at > NOW()
+              AND i.video_url_expires_at <= NOW() + (%s || ' minutes')::interval
+            ORDER BY i.video_url_expires_at ASC, i.published_at DESC
+            LIMIT %s
+            """,
+            (refresh_window_minutes,),
+        ),
+    ]
+    queue_queries = [
+        (
+            """
+            SELECT * FROM video_resolution_queue
+            WHERE source = 'youtube' AND status = 'pending' AND expires_at > NOW()
+            ORDER BY payload->>'published_at' DESC
+            LIMIT %s
+            """,
+            (),
+        ),
+        (
+            """
+            SELECT * FROM video_resolution_queue
+            WHERE source = 'youtube' AND status = 'failed' AND next_attempt_at <= NOW() AND expires_at > NOW()
+            ORDER BY attempts ASC, payload->>'published_at' DESC
+            LIMIT %s
+            """,
+            (),
+        ),
+    ]
+
+    for query, params in [item_queries[0], queue_queries[0], item_queries[1], queue_queries[1]]:
+        rows = fetch_queue_rows(query, params)
+        for row in rows:
+            processed += 1
+            if "payload" in row:
+                if resolve_youtube_queue_row(conn, row):
+                    resolved += 1
+            elif refresh_item(row):
+                refreshed += 1
+            conn.commit()
+            if remaining() <= 0:
+                break
+    return {"processed": processed, "resolved": resolved, "refreshed": refreshed}
+
+
 def cleanup_records(conn, retention_days: int, max_records: int) -> dict[str, int]:
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) AS count FROM items")
         before_count = cur.fetchone()["count"]
 
         threshold = now_utc() - timedelta(days=retention_days)
+        cur.execute("DELETE FROM video_resolution_queue WHERE expires_at <= NOW()")
+        cur.execute(
+            """
+            DELETE FROM items i
+            USING targets t
+            WHERE t.id = i.target_id
+              AND t.source = 'youtube'
+              AND i.expires_at <= NOW()
+            """
+        )
         cur.execute(
             """
             DELETE FROM items i
@@ -998,6 +1532,9 @@ def cleanup_records(conn, retention_days: int, max_records: int) -> dict[str, in
               AND NOT EXISTS (
                 SELECT 1 FROM items i WHERE i.target_id = t.id
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM video_resolution_queue vrq WHERE vrq.target_id = t.id
+            )
             """
         )
 
@@ -1037,9 +1574,12 @@ def query_records(
                 i.x_url,
                 i.images,
                 i.video_url,
+                i.expires_at,
+                i.video_url_expires_at,
                 i.published_at,
                 i.stored_at,
                 i.is_retweet,
+                t.source,
                 t.kind,
                 t.value
             FROM items i
@@ -1057,7 +1597,11 @@ def query_records(
             )
               AND (
                 %s IS NULL
-                OR LOWER(CASE WHEN t.kind = 'keyword' THEN 'search:' || t.value ELSE t.value END) = %s
+                OR LOWER(CASE
+                    WHEN t.source = 'youtube' THEN 'youtube:' || t.value
+                    WHEN t.kind = 'keyword' THEN 'search:' || t.value
+                    ELSE t.value
+                END) = %s
               )
               AND (
                 %s IS NULL
@@ -1094,7 +1638,7 @@ def query_records(
     for row in rows:
         records.append(
             {
-                "target": format_target(row["kind"], row["value"]),
+                "target": format_target_row(row),
                 "author": row["author"],
                 "fullname": row["fullname"],
                 "guid": row["guid"],
@@ -1106,6 +1650,8 @@ def query_records(
                 "x_url": row["x_url"],
                 "images": row["images"] or [],
                 "video_url": row["video_url"],
+                "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+                "video_url_expires_at": row["video_url_expires_at"].isoformat() if row["video_url_expires_at"] else None,
                 "published_at": row["published_at"].isoformat() if row["published_at"] else None,
                 "stored_at": row["stored_at"].isoformat() if row["stored_at"] else None,
                 "is_retweet": row["is_retweet"],
@@ -1165,7 +1711,7 @@ def command_monitor(args) -> int:
 
     with get_db_connection() as conn:
         if args.targets:
-            target_rows = [upsert_target(conn, target) for target in parse_targets(args.targets)]
+            target_rows = [row for row in (upsert_target(conn, target) for target in parse_targets(args.targets)) if row.get("source") == "twitter"]
         elif args.system_only:
             target_rows = load_system_targets(conn)
         elif args.include_system:
@@ -1190,7 +1736,7 @@ def command_monitor(args) -> int:
         )
         new_records = 0
         for target_row in target_rows:
-            target = format_target(target_row["kind"], target_row["value"])
+            target = format_target_row(target_row)
             previous_id = target_row.get("last_guid")
             try:
                 ordered_instances = order_instances_for_attempts(instances, runtime_penalties)
@@ -1225,6 +1771,56 @@ def command_monitor(args) -> int:
             conn.commit()
             print(
                 f"[系统] 清理完成: 保留 {stats['after']} 条，删除 {stats['deleted']} 条 "
+                f"(retention_days={retention_days}, max_records={max_records})"
+            )
+    return 0
+
+
+def command_monitor_youtube(args) -> int:
+    retention_days = args.retention_days if args.retention_days is not None else DEFAULT_RETENTION_DAYS
+    max_records = args.max_records if args.max_records is not None else DEFAULT_MAX_RECORDS
+    shard_index = args.shard_index if args.shard_index is not None else 0
+    shard_count = args.shard_count if args.shard_count is not None else 1
+
+    if shard_count <= 0:
+        raise ValueError("shard-count must be greater than 0.")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("shard-index must be between 0 and shard-count - 1.")
+
+    with get_db_connection() as conn:
+        if args.targets:
+            target_rows = [row for row in (upsert_target(conn, target) for target in parse_targets(args.targets)) if row.get("source") == "youtube"]
+        else:
+            target_rows = load_youtube_targets(conn)
+
+        target_rows = select_targets_for_shard(target_rows, shard_index, shard_count)
+        if not target_rows:
+            print(
+                f"[YouTube] 当前分片没有活跃 YouTube 订阅目标，跳过 "
+                f"(shard_index={shard_index}, shard_count={shard_count})"
+            )
+            return 0
+
+        resolved_records = 0
+        for target_row in target_rows:
+            target = format_target_row(target_row)
+            try:
+                resolved = monitor_youtube_target(conn, target_row)
+                conn.commit()
+                resolved_records += resolved
+                print(f"[{target}] 已解析 {resolved} 条 YouTube 视频")
+            except Exception as exc:
+                conn.rollback()
+                upsert_crawl_state(conn, target_row["id"], last_guid=target_row.get("last_guid"), last_error=str(exc)[:500], success=False)
+                conn.commit()
+                print(f"[{target}] YouTube 处理异常: {exc}")
+
+        print(f"[YouTube] 本轮解析 {resolved_records} 条视频")
+        if not args.skip_cleanup:
+            stats = cleanup_records(conn, retention_days, max_records)
+            conn.commit()
+            print(
+                f"[YouTube] 清理完成: 保留 {stats['after']} 条，删除 {stats['deleted']} 条 "
                 f"(retention_days={retention_days}, max_records={max_records})"
             )
     return 0
@@ -1319,6 +1915,19 @@ def command_cleanup(args) -> int:
     return 0
 
 
+def command_refresh_youtube_playback_urls(args) -> int:
+    with get_db_connection() as conn:
+        stats = refresh_youtube_playback_urls(
+            conn,
+            limit=max(1, args.limit),
+            refresh_window_minutes=max(1, args.refresh_window_minutes),
+            critical_window_minutes=max(1, args.critical_window_minutes),
+        )
+        conn.commit()
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_seed_system_targets(args) -> int:
     target_configs = parse_system_targets_file(args.file)
     with get_db_connection() as conn:
@@ -1347,6 +1956,15 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--shard-count", type=int, default=1, help="总分片数")
     monitor_parser.set_defaults(func=command_monitor)
 
+    youtube_monitor_parser = subparsers.add_parser("monitor-youtube", help="单独抓取 YouTube RSS 并解析播放 URL")
+    youtube_monitor_parser.add_argument("--targets", help="覆盖 YouTube 订阅目标，逗号或换行分隔，格式 youtube:UC...")
+    youtube_monitor_parser.add_argument("--retention-days", type=int, default=None, help="Twitter 保留天数参数；YouTube 固定按 expires_at 清理")
+    youtube_monitor_parser.add_argument("--max-records", type=int, default=None, help="最大保留记录数")
+    youtube_monitor_parser.add_argument("--skip-cleanup", action="store_true", help="本轮监控后不执行清理")
+    youtube_monitor_parser.add_argument("--shard-index", type=int, default=0, help="当前分片编号，从 0 开始")
+    youtube_monitor_parser.add_argument("--shard-count", type=int, default=1, help="总分片数")
+    youtube_monitor_parser.set_defaults(func=command_monitor_youtube)
+
     subscribe_parser = subparsers.add_parser("subscribe", help="用 API key 管理订阅列表")
     subscribe_parser.add_argument("action", choices=["add", "remove", "set", "list"], help="订阅动作")
     subscribe_parser.add_argument("--api-key", required=True, help="客户端 API key")
@@ -1367,6 +1985,12 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--retention-days", type=int, default=None, help="保留天数")
     cleanup_parser.add_argument("--max-records", type=int, default=None, help="最大保留记录数")
     cleanup_parser.set_defaults(func=command_cleanup)
+
+    refresh_youtube_parser = subparsers.add_parser("refresh-youtube-playback-urls", help="刷新 YouTube 播放 URL 并处理解析队列")
+    refresh_youtube_parser.add_argument("--limit", type=int, default=30, help="单次最多处理条数")
+    refresh_youtube_parser.add_argument("--refresh-window-minutes", type=int, default=90, help="普通刷新窗口")
+    refresh_youtube_parser.add_argument("--critical-window-minutes", type=int, default=15, help="临界过期窗口")
+    refresh_youtube_parser.set_defaults(func=command_refresh_youtube_playback_urls)
 
     seed_system_parser = subparsers.add_parser("seed-system-targets", help="初始化系统公共视频池目标")
     seed_system_parser.add_argument("--file", help="系统目标 JSON 文件；默认使用内置目标")
