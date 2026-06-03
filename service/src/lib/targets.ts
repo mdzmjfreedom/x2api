@@ -26,9 +26,14 @@ function normalizeYouTubeChannelID(raw: string) {
     const url = new URL(value);
     const host = url.host.toLowerCase();
     if (host === "youtube.com" || host === "www.youtube.com" || host === "m.youtube.com") {
-      const components = url.pathname.split("/").filter(Boolean);
-      if (components[0]?.toLowerCase() === "channel" && components[1]) {
-        channelID = components[1];
+      const feedChannelID = url.searchParams.get("channel_id")?.trim();
+      if (feedChannelID) {
+        channelID = feedChannelID;
+      } else {
+        const components = url.pathname.split("/").filter(Boolean);
+        if (components[0]?.toLowerCase() === "channel" && components[1]) {
+          channelID = components[1];
+        }
       }
     }
   } catch {

@@ -187,15 +187,20 @@ def normalize_youtube_channel_id(raw: str) -> str:
     channel_id = value
     parsed = urlparse(value)
     if parsed.netloc.lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 2 and parts[0].lower() == "channel":
-            channel_id = parts[1]
+        query = parse_qs(parsed.query)
+        feed_channel_id = (query.get("channel_id") or [""])[0].strip()
+        if feed_channel_id:
+            channel_id = feed_channel_id
+        else:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0].lower() == "channel":
+                channel_id = parts[1]
     elif value.lower().startswith("/channel/"):
         parts = [part for part in value.split("/") if part]
         if len(parts) >= 2:
             channel_id = parts[1]
     if not re.fullmatch(r"UC[A-Za-z0-9_-]{20,}", channel_id):
-        raise ValueError("YouTube channel target must be a channel ID or /channel/UC... URL.")
+        raise ValueError("YouTube channel target must be a channel ID, /channel/UC... URL, or feeds/videos.xml?channel_id=UC... URL.")
     return channel_id
 
 

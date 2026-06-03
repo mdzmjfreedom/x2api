@@ -33,6 +33,16 @@ test("parseTarget understands YouTube channel targets", () => {
   });
 });
 
+test("parseTarget understands YouTube feed URLs", () => {
+  assert.deepEqual(parseTarget("youtube:https://www.youtube.com/feeds/videos.xml?channel_id=UC1QxOK5YpyAyFCN_xiPfgHw"), {
+    source: "youtube",
+    kind: "channel",
+    value: "UC1QxOK5YpyAyFCN_xiPfgHw",
+    normalizedValue: "uc1qxok5ypyayfcn_xipfghw",
+    tags: [],
+  });
+});
+
 test("parseTargets deduplicates normalized values", () => {
   const targets = parseTargets(["OpenAI", "openai", "search:AI", "search:ai", "youtube:UCE_M8A5yxnLfW0KghEeajjw"]);
   assert.equal(targets.length, 3);
@@ -79,6 +89,29 @@ test("parseTargets accepts explicit YouTube object targets", () => {
       kind: "channel",
       value: "UCE_M8A5yxnLfW0KghEeajjw",
       normalizedValue: "uce_m8a5yxnlfw0kgheeajjw",
+      category: "tech",
+      tags: ["YouTube"],
+    },
+  ]);
+});
+
+test("parseTargets accepts explicit YouTube feed URL object targets", () => {
+  const targets = parseTargets([
+    {
+      source: "youtube",
+      kind: "channel",
+      target: "https://www.youtube.com/feeds/videos.xml?channel_id=UC1QxOK5YpyAyFCN_xiPfgHw",
+      category: "tech",
+      tags: ["YouTube"],
+    },
+  ]);
+
+  assert.deepEqual(targets, [
+    {
+      source: "youtube",
+      kind: "channel",
+      value: "UC1QxOK5YpyAyFCN_xiPfgHw",
+      normalizedValue: "uc1qxok5ypyayfcn_xipfghw",
       category: "tech",
       tags: ["YouTube"],
     },
