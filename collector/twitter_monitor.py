@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+from html import unescape as html_unescape
 import json
 import os
 import random
@@ -31,6 +32,7 @@ AUTO_TRANSLATE = os.environ.get("TRANSLATE_CONTENT", "false").lower() == "true"
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "").strip()
 YOUTUBE_RETENTION_HOURS = 72
 YOUTUBE_RSS_TIMEOUT_SECONDS = 20
+YOUTUBE_VIDEOS_PAGE_TIMEOUT_SECONDS = 20
 YOUTUBE_PLAYBACK_RESOLVER_TIMEOUT_SECONDS = 30
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -1046,7 +1048,7 @@ def make_youtube_queue_payload(target_row: dict, entry: dict, fetched_at: dateti
     expires_at = published_at + timedelta(hours=YOUTUBE_RETENTION_HOURS)
     return {
         "source": "youtube",
-        "target_id": target_row["id"],
+        "target_id": str(target_row["id"]),
         "channel_id": target_row["value"],
         "guid": guid,
         "provider_video_id": video_id,
@@ -1062,6 +1064,206 @@ def make_youtube_queue_payload(target_row: dict, entry: dict, fetched_at: dateti
         "published_at": published_at.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
+
+
+def youtube_web_text(value) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if not isinstance(value, dict):
+        return None
+
+    for key in ("content", "simpleText", "text"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        text = "".join(youtube_web_text(run) or "" for run in runs).strip()
+        return text or None
+
+    return None
+
+
+def parse_youtube_relative_datetime(value: str | None, reference: datetime) -> datetime | None:
+    if not value:
+        return None
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    normalized = re.sub(r"\s+", " ", normalized)
+    compact = normalized.replace(" ", "")
+
+    if normalized in {"now", "just now", "streamed moments ago"} or compact in {"刚刚", "剛剛", "たった今", "今"}:
+        return reference
+
+    unit_aliases: list[tuple[str, tuple[str, ...], timedelta]] = [
+        ("years", ("years", "year", "yrs", "yr", "y", "年前", "年"), timedelta(days=365)),
+        ("months", ("months", "month", "mos", "mo", "か月前", "ヶ月前", "個月前", "个月前", "月前", "か月", "ヶ月", "個月", "个月", "月"), timedelta(days=30)),
+        ("weeks", ("weeks", "week", "wks", "wk", "w", "週間前", "週前", "周前", "週間", "週", "周"), timedelta(weeks=1)),
+        ("days", ("days", "day", "d", "日前", "天前", "日", "天"), timedelta(days=1)),
+        ("hours", ("hours", "hour", "hrs", "hr", "h", "時間前", "小时前", "小時前", "時間", "小时", "小時"), timedelta(hours=1)),
+        ("minutes", ("minutes", "minute", "mins", "min", "m", "分前", "分钟前", "分鐘前", "分", "分钟", "分鐘"), timedelta(minutes=1)),
+        ("seconds", ("seconds", "second", "secs", "sec", "s", "秒前", "秒"), timedelta(seconds=1)),
+    ]
+
+    for _unit, aliases, delta in unit_aliases:
+        for alias in sorted(aliases, key=len, reverse=True):
+            if re.fullmatch(r"[a-z]+", alias):
+                pattern = rf"(\d+)\s*{re.escape(alias)}(?:\s+ago)?"
+                match = re.search(pattern, normalized)
+            else:
+                pattern = rf"(\d+)\s*{re.escape(alias)}"
+                match = re.search(pattern, compact)
+            if match:
+                amount = int(match.group(1))
+                return reference - (delta * amount)
+
+    return None
+
+
+def extract_youtube_initial_data(html: str) -> dict:
+    patterns = (
+        r"var\s+ytInitialData\s*=\s*(\{.*?\});</script>",
+        r"window\[['\"]ytInitialData['\"]\]\s*=\s*(\{.*?\});</script>",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+    raise RuntimeError("YouTube videos page initial data not found.")
+
+
+def iter_youtube_lockup_view_models(value):
+    if isinstance(value, dict):
+        lockup = value.get("lockupViewModel")
+        if isinstance(lockup, dict):
+            yield lockup
+        for child in value.values():
+            yield from iter_youtube_lockup_view_models(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_youtube_lockup_view_models(child)
+
+
+def youtube_lockup_thumbnail(lockup: dict, video_id: str) -> str:
+    sources = (
+        lockup.get("contentImage", {})
+        .get("thumbnailViewModel", {})
+        .get("image", {})
+        .get("sources", [])
+    )
+    if isinstance(sources, list):
+        candidates: list[dict] = [source for source in sources if isinstance(source, dict) and isinstance(source.get("url"), str)]
+        if candidates:
+            selected = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+            return selected["url"].strip()
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def youtube_lockup_published_at(lockup: dict, reference: datetime) -> datetime | None:
+    metadata_rows = (
+        lockup.get("metadata", {})
+        .get("lockupMetadataViewModel", {})
+        .get("metadata", {})
+        .get("contentMetadataViewModel", {})
+        .get("metadataRows", [])
+    )
+    if not isinstance(metadata_rows, list):
+        return None
+
+    for row in metadata_rows:
+        if not isinstance(row, dict):
+            continue
+        metadata_parts = row.get("metadataParts", [])
+        if not isinstance(metadata_parts, list):
+            continue
+        for part in metadata_parts:
+            if not isinstance(part, dict):
+                continue
+            candidates = [
+                youtube_web_text(part.get("text")),
+                part.get("accessibilityLabel") if isinstance(part.get("accessibilityLabel"), str) else None,
+            ]
+            for candidate in candidates:
+                published_at = parse_youtube_relative_datetime(candidate, reference)
+                if published_at:
+                    return published_at
+    return None
+
+
+def youtube_channel_title_from_page(html: str, channel_id: str) -> str:
+    match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return channel_id
+    title = html_unescape(match.group(1)).strip()
+    title = re.sub(r"\s*-\s*YouTube\s*$", "", title).strip()
+    return title or channel_id
+
+
+def youtube_lockup_entry(lockup: dict, *, channel_title: str, fetched_at: datetime) -> dict | None:
+    video_id = str(lockup.get("contentId") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return None
+
+    content_type = str(lockup.get("contentType") or "").strip()
+    if content_type and content_type != "LOCKUP_CONTENT_TYPE_VIDEO":
+        return None
+
+    published_at = youtube_lockup_published_at(lockup, fetched_at)
+    if published_at is None:
+        return None
+
+    metadata = lockup.get("metadata", {}).get("lockupMetadataViewModel", {})
+    title = youtube_web_text(metadata.get("title")) or "YouTube video"
+    thumbnail = youtube_lockup_thumbnail(lockup, video_id)
+    link = f"https://www.youtube.com/watch?v={video_id}"
+    return {
+        "id": f"yt:video:{video_id}",
+        "guid": f"yt:video:{video_id}",
+        "yt_videoid": video_id,
+        "videoId": video_id,
+        "title": title,
+        "author": channel_title,
+        "name": channel_title,
+        "link": link,
+        "published": published_at.isoformat(),
+        "updated": published_at.isoformat(),
+        "media_thumbnail": [{"url": thumbnail}],
+        "summary": "",
+        "description": "",
+        "media_description": "",
+    }
+
+
+def fetch_youtube_videos_page_entries(channel_id: str, fetched_at: datetime) -> list[dict]:
+    url = f"https://www.youtube.com/channel/{quote(channel_id, safe='')}/videos"
+    response = requests.get(
+        url,
+        params={"hl": "en", "gl": "US"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; x2api-youtube-videos/1.0)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=YOUTUBE_VIDEOS_PAGE_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    channel_title = youtube_channel_title_from_page(response.text, channel_id)
+    initial_data = extract_youtube_initial_data(response.text)
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for lockup in iter_youtube_lockup_view_models(initial_data):
+        entry = youtube_lockup_entry(lockup, channel_title=channel_title, fetched_at=fetched_at)
+        if not entry:
+            continue
+        video_id = entry["yt_videoid"]
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        entries.append(entry)
+    return entries
 
 
 def enqueue_youtube_payload(conn, payload: dict) -> bool:
@@ -1282,37 +1484,47 @@ def resolve_youtube_queue_row(conn, queue_row: dict) -> bool:
         return False
 
 
-def fetch_youtube_rss_entries(channel_id: str) -> list[dict]:
+def fetch_youtube_rss_entries(channel_id: str, fetched_at: datetime | None = None) -> list[dict]:
     import feedparser
 
+    reference = fetched_at or now_utc()
     url = "https://www.youtube.com/feeds/videos.xml?" + urlencode({"channel_id": channel_id})
     response = requests.get(
         url,
         headers={"User-Agent": "x2api-youtube-rss/1.0"},
         timeout=YOUTUBE_RSS_TIMEOUT_SECONDS,
     )
+    if response.status_code == 404:
+        print(f"[YouTube] RSS 404 for {channel_id}; fallback to /videos page")
+        return fetch_youtube_videos_page_entries(channel_id, reference)
     response.raise_for_status()
     parsed = feedparser.parse(response.content)
     if parsed.bozo:
         raise RuntimeError(f"YouTube RSS parse failed: {parsed.bozo_exception}")
-    return [dict(entry) for entry in parsed.entries]
+    entries = [dict(entry) for entry in parsed.entries]
+    if not entries:
+        print(f"[YouTube] RSS empty for {channel_id}; fallback to /videos page")
+        return fetch_youtube_videos_page_entries(channel_id, reference)
+    return entries
 
 
 def monitor_youtube_target(conn, target_row: dict) -> int:
     fetched_at = now_utc()
-    entries = fetch_youtube_rss_entries(target_row["value"])
+    entries = fetch_youtube_rss_entries(target_row["value"], fetched_at=fetched_at)
     if not entries:
         upsert_crawl_state(conn, target_row["id"], last_guid=target_row.get("last_guid"), last_error="No YouTube RSS entries returned.", success=False)
         return 0
-    latest_guid: str | None = None
+    latest_guid: str | None = target_row.get("last_guid")
+    latest_published_at: datetime | None = None
     queued = 0
     for entry in entries:
         payload = make_youtube_queue_payload(target_row, entry, fetched_at)
         if payload is None:
             continue
-        latest_guid = latest_guid or payload["guid"]
-        if target_row.get("last_guid") == payload["guid"]:
-            break
+        payload_published_at = parse_datetime(payload.get("published_at"))
+        if payload_published_at is not None and (latest_published_at is None or payload_published_at > latest_published_at):
+            latest_published_at = payload_published_at
+            latest_guid = payload["guid"]
         if item_exists_for_guid(conn, target_row["id"], payload["guid"]):
             continue
         if enqueue_youtube_payload(conn, payload):
