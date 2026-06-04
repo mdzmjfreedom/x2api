@@ -380,7 +380,6 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         END AS target,
         t.kind,
         tp.category,
-        COALESCE(tp.weight, 0) AS "profileWeight",
         i.expires_at AS "expiresAt",
         i.video_url_expires_at AS "videoUrlExpiresAt",
         COALESCE(vs.impressions, 0) AS impressions,
@@ -562,7 +561,7 @@ export async function listVideoFeed(query: VideoFeedQuery) {
         ${cursor?.id ?? null}::uuid
       )
     )
-    ORDER BY (ci."sortTime" + (LEAST(GREATEST(COALESCE(ci."profileWeight", 0), 0), 120) * INTERVAL '1 minute')) DESC, ci."storedAt" DESC, ci.id DESC
+    ORDER BY ci."sortTime" DESC, ci."storedAt" DESC, ci.id DESC
     LIMIT ${candidateLimit}
   `);
 
