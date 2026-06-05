@@ -282,6 +282,142 @@ def format_target_row(target_row: dict) -> str:
     return format_target(target_row["kind"], target_row["value"])
 
 
+def non_empty(value) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def normalized_presentation_source(source: str | None) -> str:
+    source_key = (source or "").strip().lower()
+    if source_key in {"x", "twitter"}:
+        return "twitter"
+    if source_key in {"yt", "youtube"}:
+        return "youtube"
+    if source_key in {"91", "cg91"}:
+        return CG91_SOURCE
+    if source_key in {"51", "baoliao51"}:
+        return BAOLIAO51_SOURCE
+    return source_key
+
+
+def source_display_name(source: str | None) -> str:
+    source_key = normalized_presentation_source(source)
+    return {
+        "twitter": "X",
+        "youtube": "YouTube",
+        HEILIAO_SOURCE: "黑料",
+        CG91_SOURCE: "91吃瓜",
+        BAOLIAO51_SOURCE: "51爆料",
+        DOUYIN_SOURCE: "抖阴",
+    }.get(source_key, source_key or "X")
+
+
+def display_target(value: str | None) -> str | None:
+    target = non_empty(value)
+    if not target:
+        return None
+    separator_index = target.find(":")
+    if separator_index > 0:
+        target = target[separator_index + 1 :]
+    return non_empty(target)
+
+
+def twitter_username(value: str | None) -> str | None:
+    username = non_empty(value)
+    if not username:
+        return None
+
+    parsed = urlparse(username)
+    if parsed.netloc.lower() in {"twitter.com", "www.twitter.com", "x.com", "www.x.com"}:
+        parts = [part for part in parsed.path.split("/") if part]
+        username = parts[0] if parts else ""
+    else:
+        username = username.lstrip("@").strip()
+        slash_index = username.find("/")
+        if slash_index >= 0:
+            username = username[:slash_index]
+
+    username = username.strip("@/ ")
+    return username if re.fullmatch(r"[A-Za-z0-9_]{1,15}", username) else None
+
+
+def youtube_profile_url(value: str | None) -> str | None:
+    raw = non_empty(value)
+    if not raw:
+        return None
+    if raw.lower().startswith("youtube:"):
+        raw = raw[len("youtube:") :].strip()
+    if re.fullmatch(r"UC[A-Za-z0-9_-]+", raw):
+        return f"https://www.youtube.com/channel/{raw}"
+    if raw.startswith("@"):
+        return f"https://www.youtube.com/{raw}"
+
+    parsed = urlparse(raw)
+    if parsed.netloc.lower() not in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        return None
+
+    query = parse_qs(parsed.query)
+    user = non_empty((query.get("user") or [""])[0])
+    if user:
+        return f"https://www.youtube.com/user/{user}"
+    playlist_id = non_empty((query.get("playlist_id") or [""])[0])
+    if playlist_id:
+        return f"https://www.youtube.com/playlist?list={playlist_id}"
+    channel_id = non_empty((query.get("channel_id") or [""])[0])
+    if channel_id:
+        return f"https://www.youtube.com/channel/{channel_id}"
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() in {"channel", "user", "c"}:
+        return f"https://www.youtube.com/{parts[0]}/{parts[1]}"
+    if parts and parts[0].startswith("@"):
+        return f"https://www.youtube.com/{parts[0]}"
+    return None
+
+
+def build_author_presentation(
+    *,
+    source: str | None,
+    target: str | None,
+    author: str | None,
+    fullname: str | None,
+    x_url: str | None,
+    link: str | None,
+) -> dict[str, str | None]:
+    source_key = normalized_presentation_source(source)
+    display_author = non_empty(fullname) or non_empty(author) or display_target(target) or source_display_name(source_key)
+    display_handle = None
+    author_profile_url = None
+    author_profile_platform = None
+
+    if source_key == "twitter":
+        username = twitter_username(author) or twitter_username(target) or twitter_username(x_url) or twitter_username(link)
+        display_handle = f"@{username}" if username and non_empty(fullname) else None
+        author_profile_url = f"https://x.com/{username}" if username else None
+        author_profile_platform = "X" if username else None
+    elif source_key == "youtube":
+        author_profile_url = youtube_profile_url(target) or youtube_profile_url(link)
+        author_profile_platform = "YouTube" if author_profile_url else None
+
+    return {
+        "display_author": display_author,
+        "display_handle": display_handle,
+        "author_profile_url": author_profile_url,
+        "author_profile_platform": author_profile_platform,
+    }
+
+
+def build_item_author_presentation(target_row: dict, *, author: str | None, fullname: str | None, x_url: str | None, link: str | None) -> dict[str, str | None]:
+    return build_author_presentation(
+        source=target_row.get("source"),
+        target=format_target_row(target_row),
+        author=author,
+        fullname=fullname,
+        x_url=x_url,
+        link=link,
+    )
+
+
 def normalize_heiliao_target_value(raw: str) -> str:
     value = (raw or HEILIAO_DEFAULT_BASE_URL).strip().rstrip("/")
     if not value:
@@ -1186,6 +1322,13 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
             title = tweet.get("content", "").strip()
             if len(title) > 140:
                 title = title[:137] + "..."
+            presentation = build_item_author_presentation(
+                target_row,
+                author=tweet.get("author"),
+                fullname=tweet.get("fullname"),
+                x_url=tweet.get("x_url"),
+                link=tweet.get("link"),
+            )
 
             metadata = {
                 "target": tweet.get("target"),
@@ -1203,6 +1346,10 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     guid,
                     author,
                     fullname,
+                    display_author,
+                    display_handle,
+                    author_profile_url,
+                    author_profile_platform,
                     title,
                     content,
                     raw_content,
@@ -1217,7 +1364,7 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     metadata
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (target_id, guid) DO NOTHING
                 """,
@@ -1226,6 +1373,10 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     tweet.get("guid"),
                     tweet.get("author"),
                     tweet.get("fullname"),
+                    presentation["display_author"],
+                    presentation["display_handle"],
+                    presentation["author_profile_url"],
+                    presentation["author_profile_platform"],
                     title or None,
                     tweet.get("content"),
                     tweet.get("raw_content"),
@@ -1662,6 +1813,14 @@ def resolve_youtube_playback_url(watch_url: str) -> dict:
 
 def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
     payload = queue_row["payload"] or {}
+    presentation = build_author_presentation(
+        source="youtube",
+        target=f"youtube:{payload['channel_id']}",
+        author=payload.get("author"),
+        fullname=payload.get("fullname"),
+        x_url=None,
+        link=payload.get("link"),
+    )
     metadata = {
         "target": f"youtube:{payload['channel_id']}",
         "target_type": "channel",
@@ -1680,12 +1839,18 @@ def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
         cur.execute(
             """
             INSERT INTO items (
-                target_id, guid, author, fullname, title, content, raw_content, translated_content,
+                target_id, guid, author, fullname,
+                display_author, display_handle, author_profile_url, author_profile_platform,
+                title, content, raw_content, translated_content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
+                display_author = EXCLUDED.display_author,
+                display_handle = EXCLUDED.display_handle,
+                author_profile_url = EXCLUDED.author_profile_url,
+                author_profile_platform = EXCLUDED.author_profile_platform,
                 video_url = EXCLUDED.video_url,
                 video_url_expires_at = EXCLUDED.video_url_expires_at,
                 expires_at = EXCLUDED.expires_at,
@@ -1697,6 +1862,10 @@ def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
                 payload["guid"],
                 payload.get("author"),
                 payload.get("fullname"),
+                presentation["display_author"],
+                presentation["display_handle"],
+                presentation["author_profile_url"],
+                presentation["author_profile_platform"],
                 payload.get("title"),
                 payload.get("content"),
                 payload.get("raw_content"),
@@ -2202,6 +2371,13 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
     expires_at = published_at + timedelta(hours=retention_hours)
     content = detail.get("description") or detail.get("title") or player.get("video_title")
     images = [detail["image"]] if detail.get("image") else []
+    presentation = build_item_author_presentation(
+        target_row,
+        author=HEILIAO_SITE_NAME,
+        fullname=HEILIAO_SITE_NAME,
+        x_url=None,
+        link=detail["url"],
+    )
     metadata = {
         "target": format_target_row(target_row),
         "target_type": HEILIAO_KIND,
@@ -2223,12 +2399,18 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
         cur.execute(
             """
             INSERT INTO items (
-                target_id, guid, author, fullname, title, content, raw_content, translated_content,
+                target_id, guid, author, fullname,
+                display_author, display_handle, author_profile_url, author_profile_platform,
+                title, content, raw_content, translated_content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
+                display_author = EXCLUDED.display_author,
+                display_handle = EXCLUDED.display_handle,
+                author_profile_url = EXCLUDED.author_profile_url,
+                author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
                 raw_content = EXCLUDED.raw_content,
@@ -2245,6 +2427,10 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
                 player["guid"],
                 HEILIAO_SITE_NAME,
                 HEILIAO_SITE_NAME,
+                presentation["display_author"],
+                presentation["display_handle"],
+                presentation["author_profile_url"],
+                presentation["author_profile_platform"],
                 player.get("video_title") or detail.get("title"),
                 content,
                 detail.get("title"),
@@ -2567,6 +2753,13 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
     expires_at = published_at + timedelta(hours=retention_hours)
     content = detail.get("description") or detail.get("title") or player.get("video_title")
     images = [detail["image"]] if detail.get("image") else []
+    presentation = build_item_author_presentation(
+        target_row,
+        author=CG91_SITE_NAME,
+        fullname=CG91_SITE_NAME,
+        x_url=None,
+        link=detail["url"],
+    )
     metadata = {
         "target": format_target_row(target_row),
         "target_type": CG91_KIND,
@@ -2588,12 +2781,18 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
         cur.execute(
             """
             INSERT INTO items (
-                target_id, guid, author, fullname, title, content, raw_content, translated_content,
+                target_id, guid, author, fullname,
+                display_author, display_handle, author_profile_url, author_profile_platform,
+                title, content, raw_content, translated_content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
+                display_author = EXCLUDED.display_author,
+                display_handle = EXCLUDED.display_handle,
+                author_profile_url = EXCLUDED.author_profile_url,
+                author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
                 raw_content = EXCLUDED.raw_content,
@@ -2610,6 +2809,10 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
                 player["guid"],
                 CG91_SITE_NAME,
                 CG91_SITE_NAME,
+                presentation["display_author"],
+                presentation["display_handle"],
+                presentation["author_profile_url"],
+                presentation["author_profile_platform"],
                 player.get("video_title") or detail.get("title"),
                 content,
                 detail.get("title"),
@@ -2862,16 +3065,61 @@ def upsert_baoliao51_video_item(conn, target_row: dict, detail: dict, player: di
     expires_at = published_at + timedelta(hours=retention_hours)
     content = detail.get("description") or detail.get("title") or player.get("video_title")
     images = [detail["image"]] if detail.get("image") else []
+    presentation = build_item_author_presentation(
+        target_row,
+        author=BAOLIAO51_SITE_NAME,
+        fullname=BAOLIAO51_SITE_NAME,
+        x_url=None,
+        link=detail["url"],
+    )
     metadata = {"target": format_target_row(target_row), "target_type": BAOLIAO51_KIND, "target_value": target_row["value"], "site_name": BAOLIAO51_SITE_NAME, "source_url": detail["url"], "page_id": detail["page_id"], "player_index": player["player_index"], "page_video_count": len(detail.get("players") or []), "baoliao51_video_id": player["video_id"], "video_type": player["video_type"], "tags": player.get("tags") or [], "date_modified": detail.get("modified_at").isoformat() if detail.get("modified_at") else None, "resolver": "baoliao51-dplayer", "resolved_at": now_iso(), "video_url_expires_at": verified["video_url_expires_at"].isoformat()}
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO items (target_id, guid, author, fullname, title, content, raw_content, translated_content, link, x_url, images, video_url, expires_at, video_url_expires_at, published_at, stored_at, is_retweet, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, raw_content = EXCLUDED.raw_content, images = EXCLUDED.images, video_url = EXCLUDED.video_url, expires_at = EXCLUDED.expires_at, video_url_expires_at = EXCLUDED.video_url_expires_at, published_at = COALESCE(items.published_at, EXCLUDED.published_at), metadata = items.metadata || EXCLUDED.metadata
+            INSERT INTO items (
+                target_id, guid, author, fullname,
+                display_author, display_handle, author_profile_url, author_profile_platform,
+                title, content, raw_content, translated_content,
+                link, x_url, images, video_url, expires_at, video_url_expires_at,
+                published_at, stored_at, is_retweet, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            ON CONFLICT (target_id, guid) DO UPDATE SET
+                display_author = EXCLUDED.display_author,
+                display_handle = EXCLUDED.display_handle,
+                author_profile_url = EXCLUDED.author_profile_url,
+                author_profile_platform = EXCLUDED.author_profile_platform,
+                title = EXCLUDED.title,
+                content = EXCLUDED.content,
+                raw_content = EXCLUDED.raw_content,
+                images = EXCLUDED.images,
+                video_url = EXCLUDED.video_url,
+                expires_at = EXCLUDED.expires_at,
+                video_url_expires_at = EXCLUDED.video_url_expires_at,
+                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
+                metadata = items.metadata || EXCLUDED.metadata
             RETURNING (xmax = 0) AS inserted
             """,
-            (target_row["id"], player["guid"], BAOLIAO51_SITE_NAME, BAOLIAO51_SITE_NAME, player.get("video_title") or detail.get("title"), content, detail.get("title"), detail["url"], Jsonb(images), verified["video_url"], expires_at, verified["video_url_expires_at"], published_at, Jsonb(metadata)),
+            (
+                target_row["id"],
+                player["guid"],
+                BAOLIAO51_SITE_NAME,
+                BAOLIAO51_SITE_NAME,
+                presentation["display_author"],
+                presentation["display_handle"],
+                presentation["author_profile_url"],
+                presentation["author_profile_platform"],
+                player.get("video_title") or detail.get("title"),
+                content,
+                detail.get("title"),
+                detail["url"],
+                Jsonb(images),
+                verified["video_url"],
+                expires_at,
+                verified["video_url_expires_at"],
+                published_at,
+                Jsonb(metadata),
+            ),
         )
         row = cur.fetchone()
     return bool(row and row.get("inserted"))
@@ -3377,6 +3625,13 @@ def upsert_douyin_video_item(conn, target_row: dict, item: dict, verified: dict,
     expires_at = published_at + timedelta(hours=retention_hours)
     content = item.get("description") or item.get("title")
     images = [item["image"]] if item.get("image") else []
+    presentation = build_item_author_presentation(
+        target_row,
+        author=DOUYIN_SITE_NAME,
+        fullname=DOUYIN_SITE_NAME,
+        x_url=None,
+        link=item["source_url"],
+    )
     metadata = {
         "target": format_target_row(target_row),
         "target_type": DOUYIN_KIND,
@@ -3404,12 +3659,50 @@ def upsert_douyin_video_item(conn, target_row: dict, item: dict, verified: dict,
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO items (target_id, guid, author, fullname, title, content, raw_content, translated_content, link, x_url, images, video_url, expires_at, video_url_expires_at, published_at, stored_at, is_retweet, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET title = EXCLUDED.title, content = EXCLUDED.content, raw_content = EXCLUDED.raw_content, images = EXCLUDED.images, video_url = EXCLUDED.video_url, expires_at = EXCLUDED.expires_at, video_url_expires_at = EXCLUDED.video_url_expires_at, published_at = COALESCE(items.published_at, EXCLUDED.published_at), metadata = items.metadata || EXCLUDED.metadata
+            INSERT INTO items (
+                target_id, guid, author, fullname,
+                display_author, display_handle, author_profile_url, author_profile_platform,
+                title, content, raw_content, translated_content,
+                link, x_url, images, video_url, expires_at, video_url_expires_at,
+                published_at, stored_at, is_retweet, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            ON CONFLICT (target_id, guid) DO UPDATE SET
+                display_author = EXCLUDED.display_author,
+                display_handle = EXCLUDED.display_handle,
+                author_profile_url = EXCLUDED.author_profile_url,
+                author_profile_platform = EXCLUDED.author_profile_platform,
+                title = EXCLUDED.title,
+                content = EXCLUDED.content,
+                raw_content = EXCLUDED.raw_content,
+                images = EXCLUDED.images,
+                video_url = EXCLUDED.video_url,
+                expires_at = EXCLUDED.expires_at,
+                video_url_expires_at = EXCLUDED.video_url_expires_at,
+                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
+                metadata = items.metadata || EXCLUDED.metadata
             RETURNING (xmax = 0) AS inserted
             """,
-            (target_row["id"], item["guid"], DOUYIN_SITE_NAME, DOUYIN_SITE_NAME, item.get("title"), content, item.get("title"), item["source_url"], Jsonb(images), verified["video_url"], expires_at, verified["video_url_expires_at"], published_at, Jsonb(metadata)),
+            (
+                target_row["id"],
+                item["guid"],
+                DOUYIN_SITE_NAME,
+                DOUYIN_SITE_NAME,
+                presentation["display_author"],
+                presentation["display_handle"],
+                presentation["author_profile_url"],
+                presentation["author_profile_platform"],
+                item.get("title"),
+                content,
+                item.get("title"),
+                item["source_url"],
+                Jsonb(images),
+                verified["video_url"],
+                expires_at,
+                verified["video_url_expires_at"],
+                published_at,
+                Jsonb(metadata),
+            ),
         )
         row = cur.fetchone()
     return bool(row and row.get("inserted"))

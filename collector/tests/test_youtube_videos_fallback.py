@@ -80,6 +80,7 @@ class YouTubeVideosFallbackTest(unittest.TestCase):
             {"id": UUID("01234567-89ab-cdef-0123-456789abcdef"), "value": "UC1QxOK5YpyAyFCN_xiPfgHw"},
             entry,
             self.reference,
+            None,
         )
 
         self.assertIsNotNone(payload)
@@ -112,6 +113,7 @@ class YouTubeVideosFallbackTest(unittest.TestCase):
             {"id": "target-id", "value": "UC1QxOK5YpyAyFCN_xiPfgHw"},
             entry,
             self.reference,
+            None,
         )
 
         self.assertIsNone(payload)
