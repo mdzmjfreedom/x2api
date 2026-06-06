@@ -66,6 +66,7 @@ DOUYIN_RETENTION_HOURS = int(os.environ.get("DOUYIN_RETENTION_HOURS", "84"))
 DOUYIN_REQUEST_TIMEOUT_SECONDS = 30
 DOUYIN_API_SECRET = "x3t8rvtaescfe38s"
 DOUYIN_TIMEZONE = timezone(timedelta(hours=8))
+DOUYIN_EMPTY_DESCRIPTIONS = {"当前暂无简介"}
 DETAIL_LINK_PROFILE_SOURCES = {
     HEILIAO_SOURCE,
     CG91_SOURCE,
@@ -3596,6 +3597,11 @@ def douyin_item_tags(item: dict) -> list[str]:
     return tags
 
 
+def clean_douyin_description(value: str | None) -> str:
+    description = (value or "").strip()
+    return "" if description in DOUYIN_EMPTY_DESCRIPTIONS else description
+
+
 def douyin_video_url(base_url: str, raw_url: str) -> str:
     return urljoin(base_url + "/", raw_url.strip())
 
@@ -3634,7 +3640,7 @@ def normalize_douyin_item(base_url: str, item: dict) -> dict | None:
         return None
     user = item.get("user") if isinstance(item.get("user"), dict) else {}
     title = str(item.get("name") or "").strip() or "抖阴视频"
-    description = str(item.get("description") or "").strip()
+    description = clean_douyin_description(str(item.get("description") or ""))
     image = item.get("img") if isinstance(item.get("img"), str) and item.get("img") else None
     return {
         "guid": f"douyin:{video_id}",
