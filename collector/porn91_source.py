@@ -507,10 +507,10 @@ def item_exists_for_guid(conn, target_id: str, guid: str) -> bool:
         return cur.fetchone() is not None
 
 
-def update_existing_item_text(conn, target_id: str, guid: str, title: str | None) -> None:
+def update_existing_item_text(conn, target_id: str, guid: str, title: str | None) -> bool:
     text = non_empty(title)
     if not text:
-        return
+        return False
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -524,6 +524,7 @@ def update_existing_item_text(conn, target_id: str, guid: str, title: str | None
             """,
             (text, text, text, target_id, guid),
         )
+        return cur.rowcount > 0
 
 
 def upsert_crawl_state(conn, target_id: str, *, last_guid: str | None, last_error: str | None, success: bool) -> None:
@@ -638,13 +639,13 @@ def upsert_video_item(conn, target_row: dict, detail: dict, player: dict, verifi
 def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, public_pool: bool, dry_run: bool = False) -> dict:
     target_row = None if dry_run else ensure_target(conn, base_url, public_pool=public_pool)
     cutoff = now_utc() - timedelta(hours=retention_hours)
-    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_detail_errors = skipped_unverified = skipped_old = pages = 0
+    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_detail_errors = skipped_unverified = skipped_old = pages = text_refreshed = 0
     samples = []
     latest_guid = None
     for page in range(1, max_pages + 1):
         pages += 1
         list_items = parse_list_page(base_url, page)
-        page_inserted = page_existing = page_old = page_updated = page_verified = page_detail_errors = page_unverified = page_parsed_videos = 0
+        page_inserted = page_existing = page_old = page_updated = page_verified = page_detail_errors = page_unverified = page_parsed_videos = page_text_refreshed = 0
         print(f"[91porn] page={page} list_items={len(list_items)} url={build_list_page_url(base_url, page)}")
         if not list_items:
             print(f"[91porn] page={page} empty_list stop=true")
@@ -656,7 +657,9 @@ def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, p
                 page_old += 1
                 continue
             if target_row and item_exists_for_guid(conn, str(target_row["id"]), list_item["guid"]):
-                update_existing_item_text(conn, str(target_row["id"]), list_item["guid"], list_item.get("title"))
+                if update_existing_item_text(conn, str(target_row["id"]), list_item["guid"], list_item.get("title")):
+                    text_refreshed += 1
+                    page_text_refreshed += 1
                 skipped_existing += 1
                 page_existing += 1
                 continue
@@ -705,12 +708,12 @@ def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, p
             upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid, last_error=None, success=True)
         print(
             f"[91porn] page={page} parsed_videos={page_parsed_videos} verified={page_verified} "
-            f"inserted={page_inserted} updated={page_updated} existing={page_existing} old={page_old} "
+            f"inserted={page_inserted} updated={page_updated} existing={page_existing} text_refreshed={page_text_refreshed} old={page_old} "
             f"detail_errors={page_detail_errors} unverified={page_unverified}"
         )
-        if page_inserted == 0 and (page_existing > 0 or page_old == len(list_items)):
+        if page_inserted == 0 and page_old == len(list_items):
             break
-    return {"pages": pages, "parsed_videos": parsed_videos, "verified": verified_count, "inserted": inserted, "updated": updated, "skipped_existing": skipped_existing, "skipped_detail_errors": skipped_detail_errors, "skipped_unverified": skipped_unverified, "skipped_old": skipped_old, "samples": samples[:10]}
+    return {"pages": pages, "parsed_videos": parsed_videos, "verified": verified_count, "inserted": inserted, "updated": updated, "text_refreshed": text_refreshed, "skipped_existing": skipped_existing, "skipped_detail_errors": skipped_detail_errors, "skipped_unverified": skipped_unverified, "skipped_old": skipped_old, "samples": samples[:10]}
 
 
 def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critical_window_minutes: int) -> dict[str, int]:
