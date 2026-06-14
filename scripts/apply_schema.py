@@ -7,6 +7,75 @@ from pathlib import Path
 from psycopg import connect
 
 
+ADMIN_LOCK_KEYS = [
+    0x6B4D5F3141444D4E,
+    0x6B4D5F434C45414E,
+    0x6B4D5F4D414E4147,
+    0x6B4D5F5457495454,
+    0x6B4D5F5954554245,
+    0x6B4D5F4845494C49,
+    0x6B4D5F434739315F,
+    0x6B4D5F42414F3531,
+    0x6B4D5F444F55594E,
+    0x6B4D5F31384D485F,
+    0x6B4D5F524F555F5F,
+    0x6B4D5F4441444146,
+    0x6B4D5F31384A5F5F,
+    0x6B4D5F314D544946,
+    0x6B4D5F39315041,
+    0x6B4D5F3931504F52,
+    0x6B4D5F393152425F,
+    0x6B4D5F4156474F4F,
+    0x6B4D5F3730354853,
+    0x6B4D5F5858585449,
+    0x6B4D5F4146464149,
+    0x6B4D5F4154544143,
+    0x6B4D5F4449525459,
+    0x6B4D5F494E464C47,
+    0x6B4D5F4D49535341,
+    0x6B4D5F4241444E45,
+    0x6B4D5F424452515F,
+    0x6B4D5F54494B504F,
+]
+
+DB_SLOT_LOCK_BASE = 0x6B4D5F534C4F5400
+
+
+def advisory_lock_key(value: int) -> int:
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def acquire_admin_lock(conn) -> None:
+    with conn.cursor() as cur:
+        for lock_key in ADMIN_LOCK_KEYS:
+            cur.execute("SELECT pg_advisory_lock(%s)", (advisory_lock_key(lock_key),))
+
+
+def release_admin_lock(conn) -> None:
+    with conn.cursor() as cur:
+        for lock_key in reversed(ADMIN_LOCK_KEYS):
+            cur.execute("SELECT pg_advisory_unlock(%s)", (advisory_lock_key(lock_key),))
+
+
+def db_lock_max_writers() -> int:
+    return max(1, int(os.environ.get("DB_LOCK_MAX_WRITERS", "4")))
+
+
+def acquire_all_db_slots(conn) -> list[int]:
+    slots = []
+    with conn.cursor() as cur:
+        for slot in range(db_lock_max_writers()):
+            cur.execute("SELECT pg_advisory_lock(%s)", (advisory_lock_key(DB_SLOT_LOCK_BASE + slot),))
+            slots.append(slot)
+    return slots
+
+
+def release_db_slots(conn, slots: list[int]) -> None:
+    with conn.cursor() as cur:
+        for slot in reversed(slots):
+            cur.execute("SELECT pg_advisory_unlock(%s)", (advisory_lock_key(DB_SLOT_LOCK_BASE + slot),))
+
+
 def split_sql(sql: str) -> list[str]:
     statements: list[str] = []
     current: list[str] = []
@@ -54,10 +123,17 @@ def main() -> int:
     statements = split_sql(schema_path.read_text(encoding="utf-8"))
 
     with connect(database_url, prepare_threshold=None) as conn:
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
-        conn.commit()
+        slots = acquire_all_db_slots(conn)
+        acquire_admin_lock(conn)
+        try:
+            with conn.cursor() as cur:
+                for statement in statements:
+                    cur.execute(statement)
+            conn.commit()
+        finally:
+            conn.rollback()
+            release_admin_lock(conn)
+            release_db_slots(conn, slots)
 
     print({"applied_statements": len(statements)})
     return 0

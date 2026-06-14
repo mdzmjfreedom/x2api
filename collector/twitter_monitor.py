@@ -11,6 +11,7 @@ import os
 import random
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from psycopg import connect
+from psycopg.errors import OperationalError
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -715,6 +717,128 @@ def get_db_connection():
     # Supabase transaction pooler is the safest fit for short-lived jobs such
     # as GitHub Actions, but it doesn't support prepared statements.
     return connect(require_database_url(), row_factory=dict_row, prepare_threshold=None)
+
+
+LOCK_KEYS = {
+    "admin": 0x6B4D5F3141444D4E,
+    "cleanup": 0x6B4D5F434C45414E,
+    "manage": 0x6B4D5F4D414E4147,
+    "twitter": 0x6B4D5F5457495454,
+    "youtube": 0x6B4D5F5954554245,
+    "heiliao": 0x6B4D5F4845494C49,
+    "cg91": 0x6B4D5F434739315F,
+    "baoliao51": 0x6B4D5F42414F3531,
+    "douyin": 0x6B4D5F444F55594E,
+    "18mh": 0x6B4D5F31384D485F,
+    "rou": 0x6B4D5F524F555F5F,
+    "dadaafa": 0x6B4D5F4441444146,
+    "18j": 0x6B4D5F31384A5F5F,
+    "1mtif": 0x6B4D5F314D544946,
+    "91porna": 0x6B4D5F39315041,
+    "91porn": 0x6B4D5F3931504F52,
+    "91rb": 0x6B4D5F393152425F,
+    "avgood": 0x6B4D5F4156474F4F,
+    "705hs": 0x6B4D5F3730354853,
+    "xxxtik": 0x6B4D5F5858585449,
+    "affair": 0x6B4D5F4146464149,
+    "attach": 0x6B4D5F4154544143,
+    "dirtyship": 0x6B4D5F4449525459,
+    "influencersgonewild": 0x6B4D5F494E464C47,
+    "missav": 0x6B4D5F4D49535341,
+    "badnews": 0x6B4D5F4241444E45,
+    "bdrq": 0x6B4D5F424452515F,
+    "tikporn": 0x6B4D5F54494B504F,
+    "other": 0x6B4D5F4F54484552,
+}
+
+DB_SLOT_LOCK_BASE = 0x6B4D5F534C4F5400
+
+
+def lock_key_for_source(source: str | None) -> int:
+    key = LOCK_KEYS.get((source or "").lower(), LOCK_KEYS["other"])
+    return key - (1 << 64) if key >= 1 << 63 else key
+
+
+def advisory_lock_key(value: int) -> int:
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def db_lock_max_writers() -> int:
+    return max(1, int(os.environ.get("DB_LOCK_MAX_WRITERS", "4")))
+
+
+def release_db_lock(conn, lock_name: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key_for_source(lock_name),))
+
+
+def try_acquire_db_lock(conn, lock_name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s) AS locked", (lock_key_for_source(lock_name),))
+        row = cur.fetchone()
+    return bool(row and row["locked"])
+
+
+def slot_lock_key(slot: int) -> int:
+    return advisory_lock_key(DB_SLOT_LOCK_BASE + slot)
+
+
+def try_acquire_db_slot(conn) -> int | None:
+    with conn.cursor() as cur:
+        for slot in range(db_lock_max_writers()):
+            cur.execute("SELECT pg_try_advisory_lock(%s) AS locked", (slot_lock_key(slot),))
+            row = cur.fetchone()
+            if row and row["locked"]:
+                return slot
+    return None
+
+
+def release_db_slot(conn, slot: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (slot_lock_key(slot),))
+
+
+def wait_for_db_lock(lock_name: str):
+    timeout_seconds = int(os.environ.get("DB_LOCK_WAIT_TIMEOUT_SECONDS", "1800"))
+    poll_seconds = max(1, int(os.environ.get("DB_LOCK_POLL_SECONDS", "5")))
+    deadline = time.monotonic() + timeout_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        conn = get_db_connection()
+        slot = None
+        try:
+            slot = try_acquire_db_slot(conn)
+            if slot is not None:
+                if try_acquire_db_lock(conn, lock_name):
+                    return conn, slot
+                release_db_slot(conn, slot)
+        except OperationalError:
+            conn.close()
+            raise
+        conn.close()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for DB lock: {lock_name}")
+        if attempt == 1 or attempt % 12 == 0:
+            print(f"[db-lock] still waiting lock={lock_name} attempts={attempt} max_writers={db_lock_max_writers()}")
+        time.sleep(poll_seconds)
+
+
+def lock_name_for_command(func_name: str, args) -> str | None:
+    if func_name == "command_monitor":
+        return "twitter"
+    if func_name in {"command_register_client", "command_seed_system_targets"}:
+        return "admin"
+    if func_name == "command_cleanup":
+        return "cleanup"
+    if func_name == "command_subscribe":
+        if getattr(args, "action", None) in {"add", "remove", "set"}:
+            return "manage"
+        return None
+    match = re.match(r"^command_(?:monitor|refresh)_(.+?)(?:_playback_urls)?$", func_name)
+    if match:
+        return match.group(1)
+    return None
 
 
 def normalize_target(target: str) -> str:
@@ -5986,7 +6110,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    lock_name = lock_name_for_command(args.func.__name__, args)
+    if not lock_name:
+        return args.func(args)
+    print(f"[db-lock] waiting lock={lock_name}")
+    lock_conn, lock_slot = wait_for_db_lock(lock_name)
+    print(f"[db-lock] acquired lock={lock_name} slot={lock_slot}")
+    try:
+        return args.func(args)
+    finally:
+        try:
+            release_db_lock(lock_conn, lock_name)
+            release_db_slot(lock_conn, lock_slot)
+            print(f"[db-lock] released lock={lock_name} slot={lock_slot}")
+        except OperationalError as exc:
+            print(f"[db-lock] release failed lock={lock_name}: {exc}")
+        finally:
+            lock_conn.close()
 
 
 if __name__ == "__main__":
