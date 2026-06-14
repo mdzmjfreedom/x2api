@@ -42,6 +42,10 @@ AD_HOST_KEYWORDS = (
 )
 
 
+class TemporarySourceAccessError(RuntimeError):
+    pass
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -170,8 +174,12 @@ def request_with_proxy_fallback(
                 stream=stream,
                 allow_redirects=True,
             )
+            if response.status_code in {403, 429}:
+                raise TemporarySourceAccessError(f"InfluencersGoneWild returned HTTP {response.status_code} for {url}")
             response.raise_for_status()
             return response
+        except TemporarySourceAccessError:
+            raise
         except requests.RequestException as exc:
             last_error = exc
     raise last_error or ValueError("InfluencersGoneWild request failed.")
@@ -767,13 +775,19 @@ def monitor_site(
 ) -> dict:
     target_row = None if dry_run else ensure_target(conn, base_url, public_pool=public_pool)
     cutoff = now_utc() - timedelta(hours=retention_hours)
-    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_unverified = skipped_old = pages = text_refreshed = 0
+    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_unverified = skipped_old = pages = text_refreshed = skipped_access_errors = 0
     samples = []
     latest_guid = None
     for page in range(1, max_pages + 1):
         pages += 1
         try:
             list_items = parse_list_page(base_url, page)
+        except TemporarySourceAccessError as exc:
+            skipped_access_errors += 1
+            if target_row:
+                upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid, last_error=str(exc), success=False)
+            print(f"[influencersgonewild] skip page={page} access_error={exc}")
+            break
         except Exception as exc:
             if target_row:
                 upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid, last_error=str(exc), success=False)
@@ -798,6 +812,11 @@ def monitor_site(
                 continue
             try:
                 detail = parse_detail(list_item)
+            except TemporarySourceAccessError as exc:
+                skipped_unverified += 1
+                page_unverified += 1
+                print(f"[influencersgonewild] skip detail {list_item.get('url')}: {exc}")
+                continue
             except Exception as exc:
                 skipped_unverified += 1
                 page_unverified += 1
@@ -851,6 +870,7 @@ def monitor_site(
         "skipped_existing": skipped_existing,
         "skipped_unverified": skipped_unverified,
         "skipped_old": skipped_old,
+        "skipped_access_errors": skipped_access_errors,
         "samples": samples[:10],
     }
 

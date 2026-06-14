@@ -42,6 +42,10 @@ AD_HOST_KEYWORDS = (
 )
 
 
+class TemporarySourceAccessError(RuntimeError):
+    pass
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -173,8 +177,12 @@ def request_with_proxy_fallback(
                 stream=stream,
                 allow_redirects=True,
             )
+            if response.status_code in {403, 429}:
+                raise TemporarySourceAccessError(f"DirtyShip returned HTTP {response.status_code} for {url}")
             response.raise_for_status()
             return response
+        except TemporarySourceAccessError:
+            raise
         except requests.RequestException as exc:
             last_error = exc
     raise last_error or ValueError("DirtyShip request failed.")
@@ -793,13 +801,19 @@ def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, p
     base_url = normalize_dirtyship_target_value(base_url)
     target_row = None if dry_run else ensure_target(conn, base_url, public_pool=public_pool)
     cutoff = now_utc() - timedelta(hours=retention_hours)
-    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_detail_errors = skipped_unverified = skipped_old = pages = 0
+    inserted = updated = parsed_videos = verified_count = skipped_existing = skipped_detail_errors = skipped_unverified = skipped_old = pages = skipped_access_errors = 0
     samples = []
     latest_guid = None
     for page in range(1, max_pages + 1):
         pages += 1
         try:
             list_items = parse_list_page(base_url, page)
+        except TemporarySourceAccessError as exc:
+            skipped_access_errors += 1
+            if target_row:
+                upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid, last_error=str(exc), success=False)
+            print(f"[dirtyship] skip page={page} access_error={exc}")
+            break
         except Exception as exc:
             if target_row:
                 upsert_crawl_state(conn, target_row["id"], last_guid=latest_guid, last_error=str(exc), success=False)
@@ -821,6 +835,11 @@ def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, p
                 continue
             try:
                 detail = parse_detail_page(list_item["url"], list_item)
+            except TemporarySourceAccessError as exc:
+                skipped_detail_errors += 1
+                page_detail_errors += 1
+                print(f"[dirtyship] skip detail {list_item.get('url')}: {exc}")
+                continue
             except Exception as exc:
                 skipped_detail_errors += 1
                 page_detail_errors += 1
@@ -880,5 +899,6 @@ def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, p
         "skipped_detail_errors": skipped_detail_errors,
         "skipped_unverified": skipped_unverified,
         "skipped_old": skipped_old,
+        "skipped_access_errors": skipped_access_errors,
         "samples": samples[:10],
     }
