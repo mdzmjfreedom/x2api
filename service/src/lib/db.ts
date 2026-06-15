@@ -20,10 +20,36 @@ export type SqlFunction = {
 let pool: Pool | null = null;
 let sqlClient: SqlFunction | null = null;
 
+export function normalizeDatabaseUrl(databaseUrl: string) {
+  const url = new URL(databaseUrl);
+  const sslmode = url.searchParams.get("sslmode");
+
+  if (!sslmode) {
+    return databaseUrl;
+  }
+
+  const hasCustomSslMaterial =
+    url.searchParams.has("sslrootcert") ||
+    url.searchParams.has("sslcert") ||
+    url.searchParams.has("sslkey") ||
+    url.searchParams.has("sslcrl");
+
+  if (hasCustomSslMaterial) {
+    return databaseUrl;
+  }
+
+  if (sslmode === "require" || sslmode === "prefer" || sslmode === "verify-ca" || sslmode === "verify-full") {
+    url.searchParams.set("sslmode", "no-verify");
+    return url.toString();
+  }
+
+  return databaseUrl;
+}
+
 function getPool() {
   if (!pool) {
     pool = new Pool({
-      connectionString: getRequiredEnv("DATABASE_URL"),
+      connectionString: normalizeDatabaseUrl(getRequiredEnv("DATABASE_URL")),
       ssl: { rejectUnauthorized: false },
       max: 10,
       options: "-c work_mem=16MB",
