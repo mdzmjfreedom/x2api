@@ -74,12 +74,31 @@ jobs:
 
       - name: Seed system video targets
         timeout-minutes: 5
+        continue-on-error: true
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           REDIS_NAMESPACE: x2api
         run: |
           python collector/twitter_monitor.py seed-system-targets
+
+      - name: Sync OpenSearch items
+        if: vars.OPENSEARCH_SYNC_ENABLED == 'true'
+        timeout-minutes: 15
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+        run: |
+          python collector/sync_to_opensearch.py
+
+      - name: Sync OpenSearch stats
+        if: vars.OPENSEARCH_SYNC_ENABLED == 'true'
+        timeout-minutes: 10
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+        run: |
+          python collector/sync_to_opensearch.py --stats-only
 
       - name: Cleanup video feed data
         if: inputs.apply_cleanup != 'false'
@@ -104,24 +123,6 @@ jobs:
             --public-video-days "${PUBLIC_VIDEO_DAYS}" \
             --high-score-video-days "${HIGH_SCORE_VIDEO_DAYS}" \
             --high-score-threshold "${HIGH_SCORE_THRESHOLD}"
-
-      - name: Sync OpenSearch items
-        if: vars.OPENSEARCH_SYNC_ENABLED == 'true'
-        timeout-minutes: 15
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
-        run: |
-          python collector/sync_to_opensearch.py
-
-      - name: Sync OpenSearch stats
-        if: vars.OPENSEARCH_SYNC_ENABLED == 'true'
-        timeout-minutes: 10
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
-        run: |
-          python collector/sync_to_opensearch.py --stats-only
 
       - name: Prune deleted OpenSearch docs
         if: vars.OPENSEARCH_SYNC_ENABLED == 'true'
