@@ -70,15 +70,6 @@ jobs:
         run: |
           python collector/twitter_monitor.py seed-system-targets
 
-      - name: Backfill video tags
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          REDIS_NAMESPACE: x2api
-          TAG_LIMIT: ${{ inputs.tag_limit || '500' }}
-        run: |
-          python scripts/backfill_video_tags.py --apply --limit "${TAG_LIMIT}"
-
       - name: Update user feed profiles
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -87,6 +78,15 @@ jobs:
           DB_LOCK_MAX_WRITERS: "1"
         run: |
           python scripts/update_user_feed_profiles.py --lookback-days 90
+
+      - name: Backfill video tags
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          REDIS_NAMESPACE: x2api
+          TAG_LIMIT: ${{ inputs.tag_limit || '500' }}
+        run: |
+          python scripts/backfill_video_tags.py --apply --limit "${TAG_LIMIT}"
 
       - name: Cleanup video feed data
         if: inputs.apply_cleanup != 'false'
