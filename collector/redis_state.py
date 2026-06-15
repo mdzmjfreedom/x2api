@@ -19,6 +19,8 @@ DEFAULT_POLL_SECONDS = 5
 DEFAULT_MAX_WRITERS = 4
 DEFAULT_COOLDOWN_SECONDS = 3600
 DEFAULT_ITEM_SEEN_TTL_SECONDS = 604800
+DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 30
+DEFAULT_REDIS_CONNECT_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,15 @@ def redis_client():
     config = redis_config()
     if not config:
         return None
-    return redis.Redis.from_url(config.url, decode_responses=True, socket_timeout=10, socket_connect_timeout=10)
+    socket_timeout = max(1, int(os.environ.get("REDIS_SOCKET_TIMEOUT_SECONDS", str(DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS))))
+    connect_timeout = max(1, int(os.environ.get("REDIS_CONNECT_TIMEOUT_SECONDS", str(DEFAULT_REDIS_CONNECT_TIMEOUT_SECONDS))))
+    return redis.Redis.from_url(
+        config.url,
+        decode_responses=True,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=connect_timeout,
+        socket_keepalive=True,
+    )
 
 
 def namespaced_key(kind: str, *parts: str) -> str:
@@ -74,6 +84,17 @@ class RedisLock:
         self.client.eval(_RELEASE_SCRIPT, 1, self.key, self.token)
 
 
+def release_lock_safely(lock: RedisLock | None, *, source_name: str, lock_name: str) -> bool:
+    if lock is None:
+        return True
+    try:
+        lock.release()
+        return True
+    except Exception as exc:
+        print(f"[redis-lock] release warning source={source_name} lock={lock_name}: {type(exc).__name__}: {exc}")
+        return False
+
+
 @contextmanager
 def acquire_writer_locks(source: str) -> Iterator[bool]:
     client = redis_client()
@@ -103,7 +124,7 @@ def acquire_writer_locks(source: str) -> Iterator[bool]:
                 source_lock = locked_source
                 print(f"[redis-lock] acquired source={source_name} slot={slot}")
                 break
-            candidate.release()
+            release_lock_safely(candidate, source_name=source_name, lock_name=f"slot-{slot}")
         if slot_lock and source_lock:
             break
         if time.monotonic() >= deadline:
@@ -115,11 +136,12 @@ def acquire_writer_locks(source: str) -> Iterator[bool]:
     try:
         yield True
     finally:
-        if source_lock:
-            source_lock.release()
-        if slot_lock:
-            slot_lock.release()
-        print(f"[redis-lock] released source={source_name}")
+        source_released = release_lock_safely(source_lock, source_name=source_name, lock_name="source")
+        slot_released = release_lock_safely(slot_lock, source_name=source_name, lock_name="slot")
+        if source_released and slot_released:
+            print(f"[redis-lock] released source={source_name}")
+        else:
+            print(f"[redis-lock] release incomplete source={source_name}")
 
 
 def cooldown_key(source: str) -> str:
