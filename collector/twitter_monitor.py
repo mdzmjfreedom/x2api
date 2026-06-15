@@ -760,7 +760,11 @@ DB_SLOT_LOCK_BASE = 0x6B4D5F534C4F5400
 
 
 def lock_key_for_source(source: str | None) -> int:
-    key = LOCK_KEYS.get((source or "").lower(), LOCK_KEYS["other"])
+    normalized = (source or "").strip().lower()
+    key = LOCK_KEYS.get(normalized)
+    if key is None:
+        digest = hashlib.sha256((normalized or "other").encode("utf-8")).digest()
+        key = int.from_bytes(digest[:8], "big", signed=False)
     return key - (1 << 64) if key >= 1 << 63 else key
 
 
@@ -833,15 +837,17 @@ def lock_name_for_command(func_name: str, args) -> str | None:
     shard_index = getattr(args, "shard_index", None)
     shard_count = getattr(args, "shard_count", None)
 
-    def with_shard(base: str) -> str:
+    def lock_name(base: str, action: str | None = None) -> str:
+        parts = [part for part in (action, base) if part]
         if shard_index is None and shard_count is None:
-            return base
+            return "-".join(parts)
         index = shard_index if shard_index is not None else 0
         count = shard_count if shard_count is not None else 1
-        return f"{base}-shard-{index}-of-{count}"
+        parts.append(f"shard-{index}-of-{count}")
+        return "-".join(parts)
 
     if func_name == "command_monitor":
-        return with_shard("twitter")
+        return lock_name("twitter", "monitor")
     if func_name in {"command_register_client", "command_seed_system_targets"}:
         return "admin"
     if func_name == "command_cleanup":
@@ -850,9 +856,9 @@ def lock_name_for_command(func_name: str, args) -> str | None:
         if getattr(args, "action", None) in {"add", "remove", "set"}:
             return "manage"
         return None
-    match = re.match(r"^command_(?:monitor|refresh)_(.+?)(?:_playback_urls)?$", func_name)
+    match = re.match(r"^command_(monitor|refresh)_(.+?)(?:_playback_urls)?$", func_name)
     if match:
-        return with_shard(match.group(1))
+        return lock_name(match.group(2), match.group(1))
     return None
 
 
