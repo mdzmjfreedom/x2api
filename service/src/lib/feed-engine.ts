@@ -305,8 +305,26 @@ function normalizedUnique(values: Array<string | null | undefined>, max = 200) {
   return result;
 }
 
+function uniquePreservingValues(values: Array<string | null | undefined>, max = 200) {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const trimmed = value?.trim();
+    const key = normalizeKey(trimmed);
+    if (!trimmed || !key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(trimmed);
+    if (result.length >= max) {
+      break;
+    }
+  }
+  return result;
+}
+
 function combineSeenVideoKeys(recentSeenVideoKeys: string[], cursorSeenVideoKeys: string[], max = 1000) {
-  return normalizedUnique([...recentSeenVideoKeys, ...cursorSeenVideoKeys], max);
+  return uniquePreservingValues([...recentSeenVideoKeys, ...cursorSeenVideoKeys], max);
 }
 
 async function getSubscribedTargetIds(clientId: string) {
@@ -334,7 +352,7 @@ async function getRecentSeenVideoKeys(clientId: string) {
         AND fe.created_at >= NOW() - INTERVAL '30 days'
       LIMIT 1000
     `);
-    return normalizedUnique(rows.map((row) => row.videoKey), 1000);
+    return uniquePreservingValues(rows.map((row) => row.videoKey), 1000);
   });
 }
 
