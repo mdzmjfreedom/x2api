@@ -862,6 +862,7 @@ Authorization: Bearer x2d_xxx
 
 - `limit`：默认 `10`，最大 `20`
 - `cursor`：上一页返回的游标
+- `keyword`：可选，按标题、正文、作者模糊搜索；最长 80 个字符
 - `tag`：按标签过滤，可重复，也支持逗号分隔
 - `category`：按分类过滤，可重复，也支持逗号分隔；支持分类 `slug` 或显示名
 - `source`：`mixed`、`user`、`public`，默认 `mixed`

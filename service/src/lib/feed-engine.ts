@@ -7,6 +7,7 @@ import type { TargetSource } from "@/lib/targets";
 import {
   buildVideoFeedNextCursorPayload,
   compactVideoFeedCursorSeenValues,
+  normalizeVideoFeedKeyword,
   selectDiverseVideoItems,
   VIDEO_FEED_SEEN_EVENT_TYPES,
   type VideoFeedItem,
@@ -466,6 +467,10 @@ function terms(field: string, values: string[]) {
   return { terms: { [field]: values } };
 }
 
+function escapeOpenSearchWildcard(value: string) {
+  return value.replace(/[\\*?]/g, (match) => `\\${match}`);
+}
+
 function sourceFilter(source: VideoFeedQuery["source"], subscribedTargetIds: string[]) {
   if (source === "public") {
     return [{ term: { is_public_pool: true } }];
@@ -802,6 +807,7 @@ function buildFeedQuery(input: {
   seenVideoKeys: string[];
   categoryFilters: string[];
   tagFilters: string[];
+  keyword: string | null;
   profile: UserFeedProfile;
   mode: "personalized" | "explore";
 }) {
@@ -823,6 +829,22 @@ function buildFeedQuery(input: {
   const tagTerms = terms("tags", input.tagFilters);
   if (tagTerms) {
     filter.push(tagTerms);
+  }
+
+  if (input.keyword) {
+    const wildcardKeyword = `*${escapeOpenSearchWildcard(input.keyword.toLowerCase())}*`;
+    filter.push({
+      bool: {
+        should: [
+          { match_phrase: { title: input.keyword } },
+          { match_phrase: { content: input.keyword } },
+          { wildcard: { title: { value: wildcardKeyword } } },
+          { wildcard: { content: { value: wildcardKeyword } } },
+          { wildcard: { author: { value: wildcardKeyword } } },
+        ],
+        minimum_should_match: 1,
+      },
+    });
   }
 
   if (input.categoryFilters.length > 0) {
@@ -975,6 +997,7 @@ export async function listVideoFeedFromOpenSearch(query: VideoFeedQuery) {
   const cursor = decodeCursor(query.cursor, isVideoFeedCursor);
   const normalizedTags = normalizedUnique([...(query.tags ?? []), query.tag]);
   const normalizedCategories = normalizedUnique([...(query.categories ?? []), query.category]);
+  const keyword = normalizeVideoFeedKeyword(query.keyword);
   const source = query.source ?? "mixed";
   const seenIds = compactVideoFeedCursorSeenValues(cursor?.seenIds ?? []);
   const seenGuids = compactVideoFeedCursorSeenValues(cursor?.seenGuids ?? []);
@@ -998,6 +1021,7 @@ export async function listVideoFeedFromOpenSearch(query: VideoFeedQuery) {
     seenVideoKeys,
     categoryFilters,
     tagFilters: normalizedTags,
+    keyword,
     profile,
   };
   const personalizedBody = buildFeedQuery({

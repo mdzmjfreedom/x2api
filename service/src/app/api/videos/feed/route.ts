@@ -50,6 +50,7 @@ export async function GET(request: Request) {
       clientId: client.id,
       limit: parsePositiveInt(searchParams.get("limit"), "limit"),
       cursor: searchParams.get("cursor"),
+      keyword: searchParams.get("keyword"),
       tags: parseStringListParam(searchParams, "tag"),
       categories: parseStringListParam(searchParams, "category"),
       source: parseVideoFeedSource(searchParams.get("source")),

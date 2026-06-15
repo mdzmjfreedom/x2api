@@ -26,6 +26,7 @@ export type VideoFeedQuery = {
   clientId: string;
   limit?: number;
   cursor?: string | null;
+  keyword?: string | null;
   tag?: string | null;
   category?: string | null;
   tags?: string[] | null;
@@ -119,6 +120,7 @@ type DiversityState = {
 const MAX_AUTHOR_PER_PAGE = 2;
 const MAX_TARGET_PER_PAGE = 3;
 const MAX_CURSOR_SEEN_VALUES = 120;
+const MAX_VIDEO_FEED_KEYWORD_LENGTH = 80;
 
 function isVideoFeedCursor(value: unknown): value is VideoFeedCursor {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -146,6 +148,21 @@ function isVideoFeedCursor(value: unknown): value is VideoFeedCursor {
 
 function normalizeDiversityKey(value: string | null | undefined) {
   return value?.trim().toLowerCase() || null;
+}
+
+export function normalizeVideoFeedKeyword(value: string | null | undefined) {
+  const normalized = value?.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length > MAX_VIDEO_FEED_KEYWORD_LENGTH) {
+    throw new Error(`Invalid keyword. Expected at most ${MAX_VIDEO_FEED_KEYWORD_LENGTH} characters.`);
+  }
+  return normalized;
+}
+
+function escapePostgresLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 export function compactVideoFeedCursorSeenValues(values: string[]) {
@@ -490,6 +507,8 @@ async function listVideoFeedFromPostgres(query: VideoFeedQuery) {
   const sql = getSql();
   const limit = normalizeLimit(query.limit, { defaultLimit: 10, maxLimit: 20 });
   const cursor = decodeCursor(query.cursor, isVideoFeedCursor);
+  const keyword = normalizeVideoFeedKeyword(query.keyword);
+  const keywordPattern = keyword ? `%${escapePostgresLikePattern(keyword.toLowerCase())}%` : null;
   const normalizedTags = [...new Set([...(query.tags ?? []), query.tag ?? ""].map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
   const normalizedCategories = [
     ...new Set([...(query.categories ?? []), query.category ?? ""].map((category) => category.trim().toLowerCase()).filter(Boolean)),
@@ -632,6 +651,12 @@ async function listVideoFeedFromPostgres(query: VideoFeedQuery) {
             AND fe.event_type = ANY(${VIDEO_FEED_SEEN_EVENT_TYPES}::text[])
             AND fe.created_at >= NOW() - INTERVAL '30 days'
             AND ${watchedVideoKey} = ${itemVideoKey}
+        )
+        AND (
+          ${keywordPattern}::text IS NULL
+          OR LOWER(COALESCE(i.title, '')) LIKE ${keywordPattern} ESCAPE '\\'
+          OR LOWER(COALESCE(i.content, '')) LIKE ${keywordPattern} ESCAPE '\\'
+          OR LOWER(COALESCE(i.author, '')) LIKE ${keywordPattern} ESCAPE '\\'
         )
         AND (
           ${JSON.stringify(normalizedTags)}::jsonb = '[]'::jsonb

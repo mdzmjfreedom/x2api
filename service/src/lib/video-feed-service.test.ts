@@ -7,6 +7,7 @@ import {
   buildVideoFeedNextCursorPayload,
   compactVideoFeedCursorSeenValues,
   mergeVideoFeedCandidatePools,
+  normalizeVideoFeedKeyword,
   parseVideoEventType,
   selectDiverseVideoItems,
   VIDEO_FEED_SEEN_EVENT_TYPES,
@@ -295,6 +296,12 @@ test("all accepted video events are eligible for seen filtering", () => {
 
   assert.deepEqual(accepted, ["impression", "play", "finish", "like", "dislike", "skip", "share"]);
   assert.throws(() => parseVideoEventType("watchMs"), /Invalid eventType/);
+});
+
+test("normalizeVideoFeedKeyword trims whitespace and rejects overly long input", () => {
+  assert.equal(normalizeVideoFeedKeyword("  funny   cats  "), "funny cats");
+  assert.equal(normalizeVideoFeedKeyword("   "), null);
+  assert.throws(() => normalizeVideoFeedKeyword("x".repeat(81)), /Invalid keyword/);
 });
 
 test("compactVideoFeedCursorSeenValues keeps the newest unique values", () => {
