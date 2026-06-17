@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-clients", type=int, default=None, help="Optional number of clients to update.")
     parser.add_argument("--shard-index", type=int, default=int(os.environ.get("PROFILE_SHARD_INDEX", "0")), help="Client hash shard index.")
     parser.add_argument("--shard-count", type=int, default=int(os.environ.get("PROFILE_SHARD_COUNT", "1")), help="Total client hash shards.")
-    parser.add_argument("--lock-ttl-seconds", type=int, default=1800, help="Redis lock TTL for one profile update run.")
+    parser.add_argument("--lock-ttl-seconds", type=int, default=900, help="Redis lock TTL for one profile update run.")
     parser.add_argument("--lock-bucket-minutes", type=int, default=60, help="Current-time bucket used to derive the Redis lock name.")
     parser.add_argument("--no-redis-lock", action="store_true", help="Skip the optional Redis distributed lock.")
     parser.add_argument("--dry-run", action="store_true", help="Compute profiles but do not write them.")
@@ -418,6 +418,7 @@ def main() -> int:
     os.environ.setdefault("DB_LOCK_MAX_WRITERS", "1")
     lock_ttl_seconds = max(args.lock_ttl_seconds, 60)
     os.environ.setdefault("REDIS_LOCK_TTL_SECONDS", str(lock_ttl_seconds))
+    os.environ.setdefault("REDIS_LOCK_HEARTBEAT_SECONDS", str(max(5, min(lock_ttl_seconds // 3, 30))))
     lock_name = profile_lock_name(run_started_at, args.lock_bucket_minutes)
 
     def run_update() -> dict[str, Any]:

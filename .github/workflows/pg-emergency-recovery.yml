@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: '执行动作: inspect / cleanup / rewrite_items / drop_heavy_columns / apply_schema / align_items_os'
+        description: '执行动作: inspect / cleanup / rewrite_items / drop_heavy_columns / apply_schema / align_items_os / clear_redis_locks'
         required: true
         default: 'inspect'
       event_days:
@@ -78,6 +78,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
           ACTION: ${{ inputs.action }}
           EVENT_DAYS: ${{ inputs.event_days || '90' }}
           NON_VIDEO_DAYS: ${{ inputs.non_video_days || '7' }}
@@ -132,6 +133,33 @@ jobs:
               ;;
             apply_schema)
               python scripts/apply_schema.py
+              ;;
+            clear_redis_locks)
+              python - <<'PY'
+              import os
+
+              import redis
+
+              url = os.environ.get("REDIS_URL", "").strip()
+              if not url:
+                  raise SystemExit("Missing REDIS_URL")
+
+              client = redis.Redis.from_url(url, decode_responses=True, socket_timeout=20, socket_connect_timeout=10)
+              patterns = [
+                  "x2api:db-writer-slot:*",
+                  "x2api:source-lock:*",
+                  "x2api:cooldown:*",
+              ]
+              keys = []
+              for pattern in patterns:
+                  keys.extend(client.scan_iter(match=pattern, count=1000))
+              keys = sorted(set(keys))
+              print(f"found {len(keys)} redis lock keys")
+              if keys:
+                  print("\\n".join(keys))
+                  deleted = client.delete(*keys)
+                  print(f"deleted {deleted} redis keys")
+              PY
               ;;
             align_items_os)
               echo "align_items_os has been retired after OpenSearch hard cutover."

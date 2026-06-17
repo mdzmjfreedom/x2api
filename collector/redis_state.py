@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,11 +14,12 @@ try:
 except ImportError:  # pragma: no cover - optional dependency fallback
     redis = None
 
-DEFAULT_LOCK_TTL_SECONDS = 3600
+DEFAULT_LOCK_TTL_SECONDS = 900
 DEFAULT_WAIT_TIMEOUT_SECONDS = 1800
 DEFAULT_POLL_SECONDS = 5
 DEFAULT_MAX_WRITERS = 4
 DEFAULT_COOLDOWN_SECONDS = 3600
+DEFAULT_LOCK_HEARTBEAT_SECONDS = 30
 DEFAULT_ITEM_SEEN_TTL_SECONDS = 604800
 DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 30
 DEFAULT_REDIS_CONNECT_TIMEOUT_SECONDS = 10
@@ -76,12 +78,37 @@ class RedisLock:
         self.key = key
         self.ttl_seconds = ttl_seconds
         self.token = secrets.token_hex(16)
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
 
     def acquire(self) -> bool:
         return bool(self.client.set(self.key, self.token, nx=True, ex=self.ttl_seconds))
 
     def release(self) -> None:
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=1)
         self.client.eval(_RELEASE_SCRIPT, 1, self.key, self.token)
+
+    def refresh(self) -> bool:
+        value = self.client.get(self.key)
+        if value != self.token:
+            return False
+        return bool(self.client.expire(self.key, self.ttl_seconds))
+
+    def start_heartbeat(self, *, interval_seconds: int | None = None) -> None:
+        interval = max(5, int(interval_seconds or max(5, min(self.ttl_seconds // 3, DEFAULT_LOCK_HEARTBEAT_SECONDS))))
+
+        def _beat() -> None:
+            while not self._heartbeat_stop.wait(interval):
+                try:
+                    if not self.refresh():
+                        break
+                except Exception:
+                    break
+
+        self._heartbeat_thread = threading.Thread(target=_beat, name=f"redis-lock-heartbeat:{self.key}", daemon=True)
+        self._heartbeat_thread.start()
 
 
 def release_lock_safely(lock: RedisLock | None, *, source_name: str, lock_name: str) -> bool:
@@ -106,6 +133,7 @@ def acquire_writer_locks(source: str) -> Iterator[bool]:
     wait_timeout = int(os.environ.get("REDIS_LOCK_WAIT_TIMEOUT_SECONDS", os.environ.get("DB_LOCK_WAIT_TIMEOUT_SECONDS", str(DEFAULT_WAIT_TIMEOUT_SECONDS))))
     poll_seconds = max(1, int(os.environ.get("REDIS_LOCK_POLL_SECONDS", os.environ.get("DB_LOCK_POLL_SECONDS", str(DEFAULT_POLL_SECONDS)))))
     ttl_seconds = max(60, int(os.environ.get("REDIS_LOCK_TTL_SECONDS", str(DEFAULT_LOCK_TTL_SECONDS))))
+    heartbeat_seconds = max(5, int(os.environ.get("REDIS_LOCK_HEARTBEAT_SECONDS", str(DEFAULT_LOCK_HEARTBEAT_SECONDS))))
     deadline = time.monotonic() + wait_timeout
     source_name = source.strip().lower() or "other"
     slot_lock: RedisLock | None = None
@@ -122,6 +150,8 @@ def acquire_writer_locks(source: str) -> Iterator[bool]:
             if locked_source.acquire():
                 slot_lock = candidate
                 source_lock = locked_source
+                slot_lock.start_heartbeat(interval_seconds=heartbeat_seconds)
+                source_lock.start_heartbeat(interval_seconds=heartbeat_seconds)
                 print(f"[redis-lock] acquired source={source_name} slot={slot}")
                 break
             release_lock_safely(candidate, source_name=source_name, lock_name=f"slot-{slot}")
