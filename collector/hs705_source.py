@@ -693,12 +693,11 @@ def update_existing_item_text(conn, target_id: str, guid: str, item: dict) -> bo
             UPDATE items
             SET title = %s,
                 content = %s,
-                raw_content = %s,
                 images = CASE WHEN jsonb_array_length(%s::jsonb) > 0 THEN %s ELSE images END,
                 stored_at = stored_at
             WHERE target_id = %s AND guid = %s
             """,
-            (title, title, title, Jsonb(images), Jsonb(images), target_id, guid),
+            (title, title, Jsonb(images), Jsonb(images), target_id, guid),
         )
         return cur.rowcount > 0
 
@@ -770,11 +769,11 @@ def upsert_video_item(conn, target_row: dict, detail: dict, player: dict, verifi
             INSERT INTO items (
                 target_id, guid, author, fullname,
                 display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content, raw_content, translated_content,
+                title, content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
                 display_author = EXCLUDED.display_author,
                 display_handle = EXCLUDED.display_handle,
@@ -782,7 +781,6 @@ def upsert_video_item(conn, target_row: dict, detail: dict, player: dict, verifi
                 author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
-                raw_content = EXCLUDED.raw_content,
                 images = EXCLUDED.images,
                 video_url = EXCLUDED.video_url,
                 expires_at = EXCLUDED.expires_at,
@@ -801,7 +799,6 @@ def upsert_video_item(conn, target_row: dict, detail: dict, player: dict, verifi
                 presentation["author_profile_url"],
                 presentation["author_profile_platform"],
                 player.get("video_title") or detail.get("title"),
-                content,
                 content,
                 detail["url"],
                 Jsonb(images),

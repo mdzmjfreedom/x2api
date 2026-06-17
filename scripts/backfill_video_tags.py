@@ -146,8 +146,6 @@ def main() -> int:
                   i.id,
                   i.title,
                   i.content,
-                  i.raw_content,
-                  i.translated_content,
                   i.author,
                   i.fullname,
                   t.kind,
@@ -176,8 +174,6 @@ def main() -> int:
             text = normalize_text(
                 row["title"],
                 row["content"],
-                row["raw_content"],
-                row["translated_content"],
                 row["author"],
                 row["fullname"],
                 row["value"],

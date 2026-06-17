@@ -123,8 +123,6 @@ def compact_item(conn: psycopg.Connection, item_id: str) -> bool:
             SET
                 title = NULL,
                 content = NULL,
-                raw_content = NULL,
-                translated_content = NULL,
                 metadata = CASE
                     WHEN metadata = '{}'::jsonb THEN '{}'::jsonb
                     ELSE (
@@ -137,8 +135,6 @@ def compact_item(conn: psycopg.Connection, item_id: str) -> bool:
               AND (
                 title IS NOT NULL
                 OR content IS NOT NULL
-                OR raw_content IS NOT NULL
-                OR translated_content IS NOT NULL
                 OR COALESCE(metadata->>'os_compacted', 'false') <> 'true'
               )
             """,
@@ -157,8 +153,6 @@ def is_item_compacted(row: dict) -> bool:
     return (
         row.get("title") is None
         and row.get("content") is None
-        and row.get("raw_content") is None
-        and row.get("translated_content") is None
         and str(metadata.get("os_compacted")).lower() == "true"
     )
 

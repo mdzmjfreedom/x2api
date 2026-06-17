@@ -10,8 +10,6 @@ from psycopg.rows import dict_row
 
 
 DROP_COLUMNS = (
-    "title",
-    "content",
     "raw_content",
     "translated_content",
 )

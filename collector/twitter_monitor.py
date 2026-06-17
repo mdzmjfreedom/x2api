@@ -2529,8 +2529,6 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     author_profile_platform,
                     title,
                     content,
-                    raw_content,
-                    translated_content,
                     link,
                     x_url,
                     images,
@@ -2541,7 +2539,7 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     metadata
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (target_id, guid) DO NOTHING
                 RETURNING id
@@ -2557,8 +2555,6 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                     presentation["author_profile_platform"],
                     title or None,
                     tweet.get("content"),
-                    tweet.get("raw_content"),
-                    tweet.get("translated_content"),
                     tweet.get("link"),
                     tweet.get("x_url"),
                     Jsonb(tweet.get("images", [])),
@@ -3025,11 +3021,11 @@ def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
             INSERT INTO items (
                 target_id, guid, author, fullname,
                 display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content, raw_content, translated_content,
+                title, content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
                 display_author = EXCLUDED.display_author,
                 display_handle = EXCLUDED.display_handle,
@@ -3052,7 +3048,6 @@ def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
                 presentation["author_profile_platform"],
                 payload.get("title"),
                 payload.get("content"),
-                payload.get("raw_content"),
                 payload.get("link"),
                 Jsonb(payload.get("images") or []),
                 resolved["video_url"],
@@ -3241,7 +3236,6 @@ def refresh_youtube_playback_urls(conn, limit: int, refresh_window_minutes: int,
             "published_at": row["published_at"].isoformat() if row.get("published_at") else row["stored_at"].isoformat(),
             "title": row.get("title"),
             "content": row.get("content"),
-            "raw_content": row.get("raw_content"),
             "author": row.get("author"),
             "fullname": row.get("fullname"),
             "images": row.get("images") or [],
@@ -3590,11 +3584,11 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
             INSERT INTO items (
                 target_id, guid, author, fullname,
                 display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content, raw_content, translated_content,
+                title, content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
                 display_author = EXCLUDED.display_author,
                 display_handle = EXCLUDED.display_handle,
@@ -3602,7 +3596,6 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
                 author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
-                raw_content = EXCLUDED.raw_content,
                 images = EXCLUDED.images,
                 video_url = EXCLUDED.video_url,
                 expires_at = EXCLUDED.expires_at,
@@ -4026,11 +4019,11 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
             INSERT INTO items (
                 target_id, guid, author, fullname,
                 display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content, raw_content, translated_content,
+                title, content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
                 display_author = EXCLUDED.display_author,
                 display_handle = EXCLUDED.display_handle,
@@ -4038,7 +4031,6 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
                 author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
-                raw_content = EXCLUDED.raw_content,
                 images = EXCLUDED.images,
                 video_url = EXCLUDED.video_url,
                 expires_at = EXCLUDED.expires_at,
@@ -4453,8 +4445,6 @@ def query_records_from_opensearch(
                 "guid": source.get("guid") or source.get("id"),
                 "title": source.get("title"),
                 "content": source.get("content"),
-                "raw_content": source.get("raw_content"),
-                "translated_content": source.get("translated_content"),
                 "link": source.get("link"),
                 "x_url": source.get("x_url"),
                 "images": [image for image in (source.get("images") or []) if isinstance(image, str)],
@@ -4507,8 +4497,6 @@ def query_records(
                 i.fullname,
                 i.title,
                 i.content,
-                i.raw_content,
-                i.translated_content,
                 i.link,
                 i.x_url,
                 i.images,
@@ -4563,8 +4551,6 @@ def query_records(
               AND (
                 %s::text IS NULL
                 OR LOWER(COALESCE(i.content, '')) LIKE %s
-                OR LOWER(COALESCE(i.raw_content, '')) LIKE %s
-                OR LOWER(COALESCE(i.translated_content, '')) LIKE %s
                 OR LOWER(COALESCE(i.author, '')) LIKE %s
               )
               AND (%s::timestamptz IS NULL OR i.stored_at >= %s)
@@ -4577,8 +4563,6 @@ def query_records(
                 api_key,
                 normalized_target,
                 normalized_target,
-                like_keyword,
-                like_keyword,
                 like_keyword,
                 like_keyword,
                 like_keyword,
@@ -4601,8 +4585,6 @@ def query_records(
                 "guid": row["guid"],
                 "title": row["title"],
                 "content": row["content"],
-                "raw_content": row["raw_content"],
-                "translated_content": row["translated_content"],
                 "link": row["link"],
                 "x_url": row["x_url"],
                 "images": row["images"] or [],
@@ -4625,8 +4607,6 @@ def print_record(record: dict, index: int | None = None) -> None:
         print(f"   昵称: {record['fullname']}")
     print(f"   ID: {record.get('guid', '-')}")
     print(f"   内容: {record.get('content', '').strip()}")
-    if record.get("translated_content"):
-        print(f"   翻译: {record['translated_content']}")
     print(f"   Nitter: {record.get('link', '-')}")
     if record.get("x_url"):
         print(f"   X: {record['x_url']}")
@@ -4875,11 +4855,11 @@ def upsert_douyin_video_item(conn, target_row: dict, item: dict, verified: dict,
             INSERT INTO items (
                 target_id, guid, author, fullname,
                 display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content, raw_content, translated_content,
+                title, content,
                 link, x_url, images, video_url, expires_at, video_url_expires_at,
                 published_at, stored_at, is_retweet, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, NOW(), FALSE, %s)
             ON CONFLICT (target_id, guid) DO UPDATE SET
                 display_author = EXCLUDED.display_author,
                 display_handle = EXCLUDED.display_handle,
@@ -4887,7 +4867,6 @@ def upsert_douyin_video_item(conn, target_row: dict, item: dict, verified: dict,
                 author_profile_platform = EXCLUDED.author_profile_platform,
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
-                raw_content = EXCLUDED.raw_content,
                 images = EXCLUDED.images,
                 video_url = EXCLUDED.video_url,
                 expires_at = EXCLUDED.expires_at,

@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: '执行动作: inspect / cleanup / rewrite_items / apply_schema'
+        description: '执行动作: inspect / cleanup / rewrite_items / apply_schema / align_items_os'
         required: true
         default: 'inspect'
       event_days:
@@ -119,6 +119,14 @@ jobs:
               ;;
             apply_schema)
               python scripts/apply_schema.py
+              ;;
+            align_items_os)
+              args=(--reset-checkpoint)
+              if [[ "${DROP_COLUMNS}" == "true" ]]; then
+                args+=(--drop-columns)
+              fi
+              python scripts/align_pg_items_with_opensearch.py "${args[@]}"
+              python scripts/inspect_pg_usage.py
               ;;
             *)
               echo "Unsupported action: $ACTION"

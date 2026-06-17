@@ -146,8 +146,6 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
       AND (
         ${searchText}::text IS NULL
         OR LOWER(COALESCE(i.content, '')) LIKE ${searchText}
-        OR LOWER(COALESCE(i.raw_content, '')) LIKE ${searchText}
-        OR LOWER(COALESCE(i.translated_content, '')) LIKE ${searchText}
         OR LOWER(COALESCE(i.author, '')) LIKE ${searchText}
       )
       AND (
@@ -298,8 +296,8 @@ export async function listItems(query: ItemQuery): Promise<ListItemsResult> {
       i.author_profile_platform AS "authorProfilePlatform",
       i.title,
       i.content,
-      i.raw_content AS "rawContent",
-      i.translated_content AS "translatedContent",
+      NULL::text AS "rawContent",
+      NULL::text AS "translatedContent",
       i.link,
       i.x_url AS "xUrl",
       ARRAY(
@@ -396,8 +394,8 @@ export async function listItemsByFeedToken(feedToken: string, limit = 50) {
         i.author_profile_platform AS "authorProfilePlatform",
         i.title,
         i.content,
-        i.raw_content AS "rawContent",
-        i.translated_content AS "translatedContent",
+        NULL::text AS "rawContent",
+        NULL::text AS "translatedContent",
         i.link,
         i.x_url AS "xUrl",
         ARRAY(

@@ -557,7 +557,7 @@ async function listVideoFeedFromPostgres(query: VideoFeedQuery) {
         ${itemVideoKey} AS "videoKey",
         COALESCE(i.metadata->>'video_poster_url', i.images->>0) AS "coverUrl",
         i.title,
-        COALESCE(i.translated_content, i.content, i.raw_content) AS caption,
+        i.content AS caption,
         i.author,
         i.fullname,
         i.display_author AS "displayAuthor",
