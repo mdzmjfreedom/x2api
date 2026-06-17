@@ -18,9 +18,11 @@ except ModuleNotFoundError:
     )
 
 try:
-    from collector.opensearch_items import sync_item as sync_item_to_opensearch
+    from collector.opensearch_items import fetch_document
+    from collector.opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
 except ModuleNotFoundError:
-    from opensearch_items import sync_item as sync_item_to_opensearch
+    from opensearch_items import fetch_document
+    from opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
 
 
 def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critical_window_minutes: int) -> dict[str, int]:
@@ -69,7 +71,8 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
             seen_ids.add(row_id)
             processed += 1
             metadata = row["metadata"] or {}
-            source_url = metadata.get("source_url") or row.get("link")
+            source = fetch_document(row_id)
+            source_url = metadata.get("source_url")
             video_id = metadata.get("baoliao51_video_id")
             try:
                 if not source_url or not video_id:
@@ -80,7 +83,7 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
                         "guid": row["guid"],
                         "page_id": metadata.get("page_id"),
                         "url": source_url,
-                        "title": row.get("title"),
+                        "title": source.get("title"),
                         "published_at": row.get("published_at"),
                     },
                 )
@@ -112,23 +115,16 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
                     "content_type": verified.get("content_type"),
                     "content_length": verified.get("content_length"),
                 }
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE items
-                        SET video_url = %s,
-                            video_url_expires_at = %s,
-                            metadata = %s,
-                            stored_at = stored_at
-                        WHERE id = %s
-                        """,
-                        (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]),
-                    )
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    playback_headers=verified.get("playback_headers"),
+                    cover_url=detail.get("image") or metadata.get("video_poster_url"),
+                )
                 conn.commit()
-                try:
-                    sync_item_to_opensearch(conn, row_id)
-                except Exception as exc:
-                    print(f"[opensearch] 51baoliao refresh sync failed for {row['guid']}: {exc}")
                 refreshed += 1
             except Exception as exc:
                 failed += 1

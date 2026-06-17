@@ -5,16 +5,17 @@ import os
 import sys
 from pathlib import Path
 
-from psycopg import connect
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from collector.twitter_monitor import get_original_image_url  # noqa: E402
-from collector.opensearch_items import sync_items as sync_items_to_opensearch  # noqa: E402
+from collector.opensearch_items import get_client, get_items_index, update_item_document as update_opensearch_item_document  # noqa: E402
+
+try:
+    from opensearchpy import helpers
+except ModuleNotFoundError:  # pragma: no cover
+    from opensearchpy import helpers  # type: ignore
 
 
 VIDEO_THUMB_PATTERNS = (
@@ -53,73 +54,64 @@ def is_nitter_video_thumb_url(image_url: str) -> bool:
 
 def main() -> int:
     args = parse_args()
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-    if not database_url:
-        raise RuntimeError("Missing DATABASE_URL environment variable.")
-
     sample_limit = max(args.sample_limit, 0)
     checked = 0
-    changed_rows: list[tuple[list[str], object]] = []
+    changed_rows: list[tuple[str, list[str], str]] = []
     samples: list[dict[str, str]] = []
+    client = get_client()
+    if client is None:
+        raise RuntimeError("Missing OPENSEARCH_URL environment variable.")
 
-    with connect(database_url, row_factory=dict_row, prepare_threshold=None) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, guid, images
-                FROM items
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements_text(images) image_url(url)
-                    WHERE image_url.url LIKE %s
-                       OR image_url.url LIKE %s
-                       OR image_url.url LIKE %s
-                )
-                ORDER BY stored_at DESC
-                """,
-                VIDEO_THUMB_PATTERNS,
-            )
-            rows = cur.fetchall()
-
-        for row in rows:
-            checked += 1
-            images = row["images"] or []
-            rewritten_images = [
-                get_original_image_url(str(image_url))
-                if is_nitter_video_thumb_url(str(image_url))
-                else str(image_url)
-                for image_url in images
-            ]
-            if rewritten_images == images:
-                continue
-
-            changed_rows.append((rewritten_images, row["id"]))
-            if len(samples) < sample_limit:
-                for before, after in zip(images, rewritten_images):
-                    if before != after:
-                        samples.append(
-                            {
-                                "guid": str(row["guid"]),
-                                "before": str(before),
-                                "after": after,
+    query = {
+        "_source": ["guid", "images"],
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "wildcard": {
+                            "images": {
+                                "value": "*video_thumb*",
                             }
-                        )
-                        break
+                        }
+                    }
+                ]
+            }
+        },
+    }
 
-        if args.apply and changed_rows:
-            with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    UPDATE items
-                    SET images = %s
-                    WHERE id = %s
-                    """,
-                    [(Jsonb(images), item_id) for images, item_id in changed_rows],
-                )
-            conn.commit()
-            sync_items_to_opensearch(conn, [str(item_id) for _, item_id in changed_rows])
-        else:
-            conn.rollback()
+    for hit in helpers.scan(client, index=get_items_index(), query=query, preserve_order=False):
+        source = hit.get("_source") or {}
+        item_id = str(hit.get("_id") or "")
+        guid = str(source.get("guid") or "")
+        images = source.get("images") or []
+        if not item_id or not isinstance(images, list):
+            continue
+        checked += 1
+        rewritten_images = [
+            get_original_image_url(str(image_url))
+            if is_nitter_video_thumb_url(str(image_url))
+            else str(image_url)
+            for image_url in images
+        ]
+        if rewritten_images == images:
+            continue
+
+        changed_rows.append((item_id, rewritten_images, guid))
+        if len(samples) < sample_limit:
+            for before, after in zip(images, rewritten_images):
+                if before != after:
+                    samples.append(
+                        {
+                            "guid": guid,
+                            "before": str(before),
+                            "after": after,
+                        }
+                    )
+                    break
+
+    if args.apply:
+        for item_id, images, _guid in changed_rows:
+            update_opensearch_item_document(item_id, images=images)
 
     print(
         {

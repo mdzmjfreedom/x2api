@@ -22,9 +22,11 @@ except ModuleNotFoundError:
     )
 
 try:
-    from collector.opensearch_items import sync_item as sync_item_to_opensearch
+    from collector.opensearch_items import fetch_document
+    from collector.opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
 except ModuleNotFoundError:
-    from opensearch_items import sync_item as sync_item_to_opensearch
+    from opensearch_items import fetch_document
+    from opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
 
 
 def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critical_window_minutes: int) -> dict[str, int]:
@@ -73,6 +75,7 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
             seen_ids.add(row_id)
             processed += 1
             metadata = row["metadata"] or {}
+            source = fetch_document(row_id)
             base_url = metadata.get("target_value") or TIKPORN_DEFAULT_BASE_URL
             video_id = metadata.get("tikporn_video_id") or str(row["guid"]).replace(f"{TIKPORN_SOURCE}:", "", 1)
             try:
@@ -105,23 +108,15 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
                     "map_url_count": verified.get("map_url_count"),
                     "key_url_count": verified.get("key_url_count"),
                 }
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE items
-                        SET video_url = %s,
-                            video_url_expires_at = %s,
-                            metadata = %s,
-                            stored_at = stored_at
-                        WHERE id = %s
-                        """,
-                        (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]),
-                    )
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    cover_url=detail_item.get("image") or source.get("cover_url") or metadata.get("video_poster_url"),
+                )
                 conn.commit()
-                try:
-                    sync_item_to_opensearch(conn, row_id)
-                except Exception as exc:
-                    print(f"[opensearch] tikporn refresh sync failed for {row['guid']}: {exc}")
                 refreshed += 1
             except Exception as exc:
                 failed += 1

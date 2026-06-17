@@ -12,7 +12,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from collector.twitter_monitor import parse_datetime  # noqa: E402
-from collector.opensearch_items import sync_items as sync_items_to_opensearch  # noqa: E402
+from collector.opensearch_items import update_item_document as update_opensearch_item_document  # noqa: E402
 
 
 def main() -> int:
@@ -57,7 +57,8 @@ def main() -> int:
 
         conn.commit()
         if updated_ids:
-            sync_items_to_opensearch(conn, updated_ids)
+            for published_at, item_id in updates:
+                update_opensearch_item_document(str(item_id), published_at=published_at)
 
     print(
         {

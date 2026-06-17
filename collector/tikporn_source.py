@@ -9,9 +9,11 @@ import requests
 from psycopg.types.json import Jsonb
 
 try:
-    from collector.opensearch_items import sync_item as sync_item_to_opensearch
+    from collector.opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from collector.opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
 except ModuleNotFoundError:
-    from opensearch_items import sync_item as sync_item_to_opensearch
+    from opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
 
 
 TIKPORN_SITE_NAME = "Tik.Porn"
@@ -688,59 +690,33 @@ def upsert_video_item(conn, target_row: dict, item: dict, verified: dict, retent
         "map_url_count": verified.get("map_url_count"),
         "key_url_count": verified.get("key_url_count"),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                images = EXCLUDED.images,
-                video_url = EXCLUDED.video_url,
-                expires_at = EXCLUDED.expires_at,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id, (xmax = 0) AS inserted
-            """,
-            (
-                target_row["id"],
-                item["guid"],
-                presentation["display_author"],
-                presentation["display_author"],
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                item.get("title"),
-                content,
-                item["source_url"],
-                Jsonb(images),
-                verified["video_url"],
-                expires_at,
-                verified["video_url_expires_at"],
-                published_at,
-                Jsonb(metadata),
-            ),
-        )
-        row = cur.fetchone()
-    if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] tikporn item sync failed for {player['guid']}: {exc}")
-    return bool(row and row.get("inserted"))
+    author_name = presentation["display_author"]
+    _item_id, inserted = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(target_row["id"]),
+        guid=item["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=verified["video_url"],
+        expires_at=expires_at,
+        video_url_expires_at=verified["video_url_expires_at"],
+        published_at=published_at,
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=item.get("image"),
+        title=item.get("title"),
+        caption=content,
+        content=content,
+        author=author_name,
+        fullname=author_name,
+        x_url=None,
+        link=item["source_url"],
+        images=images,
+    )
+    return inserted
 
 
 def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, public_pool: bool, dry_run: bool = False) -> dict:

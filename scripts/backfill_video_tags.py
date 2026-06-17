@@ -18,7 +18,7 @@ DEFAULT_LEXICON_URL = "https://raw.githubusercontent.com/M1Z2105a4/resource/refs
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from collector.opensearch_items import sync_items as sync_items_to_opensearch  # noqa: E402
+from collector.opensearch_items import fetch_documents, update_item_document as update_opensearch_item_document  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -149,10 +149,6 @@ def main() -> int:
                 """
                 SELECT
                   i.id,
-                  COALESCE(NULLIF(i.metadata->>'item_title', ''), i.title) AS title,
-                  COALESCE(NULLIF(i.metadata->>'item_content', ''), i.content) AS content,
-                  COALESCE(NULLIF(i.metadata->>'item_author', ''), i.author) AS author,
-                  COALESCE(NULLIF(i.metadata->>'item_fullname', ''), i.fullname) AS fullname,
                   t.kind,
                   t.value,
                   COALESCE(tp.tags, '[]'::jsonb) AS profile_tags,
@@ -172,15 +168,17 @@ def main() -> int:
                 (max(args.limit, 1),),
             )
             rows = cur.fetchall()
+            documents = fetch_documents(str(row["id"]) for row in rows)
 
         for row in rows:
             scanned += 1
             profile_tags = [str(tag).strip() for tag in (row["profile_tags"] or []) if str(tag).strip()]
+            source = documents.get(str(row["id"])) or {}
             text = normalize_text(
-                row["title"],
-                row["content"],
-                row["author"],
-                row["fullname"],
+                source.get("title"),
+                source.get("content"),
+                source.get("author"),
+                source.get("fullname"),
                 row["value"],
             )
             matches = match_lexicon(text, lexicon, max(args.min_rule_score, 1))
@@ -234,7 +232,35 @@ def main() -> int:
         if args.apply:
             conn.commit()
             if touched_item_ids:
-                sync_items_to_opensearch(conn, touched_item_ids)
+                for row in rows:
+                    item_id = str(row["id"])
+                    if item_id not in touched_item_ids:
+                        continue
+                    profile_tags = [str(tag).strip().lower() for tag in (row["profile_tags"] or []) if str(tag).strip()]
+                    source = documents.get(item_id) or {}
+                    text = normalize_text(
+                        source.get("title"),
+                        source.get("content"),
+                        source.get("author"),
+                        source.get("fullname"),
+                        row["value"],
+                    )
+                    matches = match_lexicon(text, lexicon, max(args.min_rule_score, 1))
+                    merged_tags = list(profile_tags)
+                    category = str(row["profile_category"]).strip().lower() if row["profile_category"] else None
+                    for match in matches[:12]:
+                        tag_name = match.tag.strip().lower()
+                        if tag_name and tag_name not in merged_tags:
+                            merged_tags.append(tag_name)
+                        if not category and match.category:
+                            category = str(match.category).strip().lower() or None
+                    if not merged_tags and args.default_tag:
+                        merged_tags.append(str(args.default_tag).strip().lower())
+                    update_opensearch_item_document(
+                        item_id,
+                        tags=merged_tags,
+                        category=category,
+                    )
         else:
             conn.rollback()
 

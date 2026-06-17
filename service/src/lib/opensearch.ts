@@ -9,16 +9,11 @@ export function getOpenSearchItemsIndex() {
 }
 
 export function isOpenSearchFeedEnabled() {
-  const raw = process.env.OPENSEARCH_FEED_ENABLED?.trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes";
+  return Boolean(process.env.OPENSEARCH_URL?.trim());
 }
 
 export function assertOpenSearchFeedEnabled(context: string) {
   if (!isOpenSearchFeedEnabled()) {
-    throw new Error(`[${context}] OpenSearch feed is required but OPENSEARCH_FEED_ENABLED is not enabled.`);
-  }
-
-  if (!process.env.OPENSEARCH_URL?.trim()) {
     throw new Error(`[${context}] OpenSearch feed is required but OPENSEARCH_URL is not configured.`);
   }
 }

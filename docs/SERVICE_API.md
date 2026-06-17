@@ -191,9 +191,9 @@ https://x2api-service.vercel.app
 
 说明：
 
-- 稳态运行不再依赖 `collector/sync_to_opensearch.py` 作为常规维护步骤
+- 稳态运行不再依赖任何 PG->OpenSearch 常规同步脚本
 - 文档新增、视频统计更新、过期删除，都会在主业务链路内同步到 OpenSearch
-- PostgreSQL 中的 `items` 会逐步压缩掉大字段，以控制磁盘占用
+- PostgreSQL 中的 `items` 仅保留轻量关系/控制字段，重内容字段由 OpenSearch 承载
 
 ### 5.2 内容类型
 
@@ -1082,9 +1082,9 @@ DATABASE_URL=... python3 scripts/cleanup_video_feed_data.py \
 
 OpenSearch Feed 相关环境变量：
 
-- Vercel：`OPENSEARCH_URL`、`OPENSEARCH_FEED_ENABLED`、可选 `OPENSEARCH_ITEMS_INDEX`
-- GitHub Actions：secret `OPENSEARCH_URL`，repo variable `OPENSEARCH_SYNC_ENABLED=true`
-- 同步命令：`python collector/sync_to_opensearch.py`、`python collector/sync_to_opensearch.py --stats-only`、`python collector/sync_to_opensearch.py --prune-deleted`
+- Vercel：`OPENSEARCH_URL`，可选 `OPENSEARCH_ITEMS_INDEX`
+- GitHub Actions：secret `OPENSEARCH_URL`
+- 运行模式：采集、刷新、画像和服务端查询均直接读写 OpenSearch，不再依赖常规 PG->OpenSearch 同步命令
 
 ## 13. YouTube Collector 命令
 

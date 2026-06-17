@@ -14,9 +14,13 @@ from Crypto.Cipher import AES
 from psycopg.types.json import Jsonb
 
 try:
-    from collector.opensearch_items import sync_item as sync_item_to_opensearch
+    from collector.opensearch_items import update_item_document as update_opensearch_item_document
+    from collector.opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from collector.opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
 except ModuleNotFoundError:
-    from opensearch_items import sync_item as sync_item_to_opensearch
+    from opensearch_items import update_item_document as update_opensearch_item_document
+    from opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
 
 
 BDRQ_SITE_NAME = "背德人妻"
@@ -803,24 +807,16 @@ def update_existing_item_text(conn, target_id: str, guid: str, item: dict) -> bo
         return False
     images = [item["image"]] if item.get("image") else []
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE items
-            SET title = %s,
-                content = %s,
-                images = CASE WHEN jsonb_array_length(%s::jsonb) > 0 THEN %s ELSE images END,
-                stored_at = stored_at
-            WHERE target_id = %s AND guid = %s
-            RETURNING id
-            """,
-            (title, title, Jsonb(images), Jsonb(images), target_id, guid),
-        )
+        cur.execute("SELECT id FROM items WHERE target_id = %s AND guid = %s LIMIT 1", (target_id, guid))
         row = cur.fetchone()
     if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] bdrq text sync failed for {guid}: {exc}")
+        update_opensearch_item_document(
+            str(row["id"]),
+            title=title,
+            caption=title,
+            content=title,
+            images=images if images else None,
+        )
     return bool(row)
 
 
@@ -892,59 +888,33 @@ def upsert_video_item(conn, target_row: dict, detail: dict, player: dict, verifi
         "content_path_prefix": verified.get("content_path_prefix"),
         "encrypted": verified.get("encrypted"),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                images = EXCLUDED.images,
-                video_url = EXCLUDED.video_url,
-                expires_at = EXCLUDED.expires_at,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id, (xmax = 0) AS inserted
-            """,
-            (
-                target_row["id"],
-                player["guid"],
-                detail.get("author_name") or BDRQ_SITE_NAME,
-                detail.get("author_name") or BDRQ_SITE_NAME,
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                player.get("video_title") or detail.get("title"),
-                content,
-                detail["url"],
-                Jsonb(images),
-                verified["video_url"],
-                expires_at,
-                verified["video_url_expires_at"],
-                published_at,
-                Jsonb(metadata),
-            ),
-        )
-        row = cur.fetchone()
-    if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] bdrq item sync failed for {player['guid']}: {exc}")
-    return bool(row and row.get("inserted"))
+    author_name = detail.get("author_name") or BDRQ_SITE_NAME
+    _item_id, inserted = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(target_row["id"]),
+        guid=player["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=verified["video_url"],
+        expires_at=expires_at,
+        video_url_expires_at=verified["video_url_expires_at"],
+        published_at=published_at,
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=detail.get("image"),
+        title=player.get("video_title") or detail.get("title"),
+        caption=content,
+        content=content,
+        author=author_name,
+        fullname=author_name,
+        x_url=None,
+        link=detail["url"],
+        images=images,
+    )
+    return inserted
 
 
 def monitor_site(conn, *, base_url: str, max_pages: int, retention_hours: int, public_pool: bool, dry_run: bool = False) -> dict:
@@ -1071,7 +1041,7 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
             seen_ids.add(row_id)
             processed += 1
             metadata = row["metadata"] or {}
-            source_url = metadata.get("source_url") or row.get("link")
+            source_url = metadata.get("source_url")
             video_id = metadata.get("bdrq_video_id") or str(row["guid"]).replace(f"{BDRQ_SOURCE}:", "", 1)
             try:
                 if not source_url and video_id:
@@ -1109,15 +1079,14 @@ def refresh_playback_urls(conn, limit: int, refresh_window_minutes: int, critica
                     "content_path_prefix": verified.get("content_path_prefix"),
                     "encrypted": verified.get("encrypted"),
                 }
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """UPDATE items SET video_url = %s, video_url_expires_at = %s, metadata = %s, stored_at = stored_at WHERE id = %s""",
-                        (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]),
-                    )
-                try:
-                    sync_item_to_opensearch(conn, str(row["id"]))
-                except Exception as exc:
-                    print(f"[opensearch] bdrq refresh sync failed for {row['guid']}: {exc}")
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    cover_url=detail.get("image") or metadata.get("video_poster_url"),
+                )
                 refreshed += 1
             except Exception as exc:
                 failed += 1

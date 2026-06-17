@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Sync items from PostgreSQL to OpenSearch.
+Retired legacy PG->OpenSearch sync module.
 
-Usage:
-    DATABASE_URL=... OPENSEARCH_URL=... python3 collector/sync_to_opensearch.py [--full] [--stats-only] [--prune-deleted] [--reset-checkpoint] [--limit N]
+The runtime architecture has been hard-cut to:
+- PostgreSQL `items`: lightweight relation/control fields
+- OpenSearch `x2_items`: heavy content/read model
 
-Options:
-    --full        Full re-sync all items (default: incremental)
-    --stats-only  Only update video_stats scores (no new items)
-    --prune-deleted Delete OpenSearch docs whose items no longer exist in PostgreSQL
-    --reset-checkpoint Reset the item sync checkpoint before syncing
-    --limit N     Limit number of items to sync per batch
+This file remains only for historical tests and reference helpers.
 """
 
 import argparse

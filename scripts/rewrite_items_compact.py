@@ -10,6 +10,17 @@ from psycopg.rows import dict_row
 
 
 DROP_COLUMNS = (
+    "author",
+    "fullname",
+    "display_author",
+    "display_handle",
+    "author_profile_url",
+    "author_profile_platform",
+    "title",
+    "content",
+    "link",
+    "x_url",
+    "images",
     "raw_content",
     "translated_content",
 )

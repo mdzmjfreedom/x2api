@@ -33,18 +33,21 @@ except ModuleNotFoundError:
     from redis_state import acquire_writer_locks
 
 try:
-    from collector.opensearch_items import sync_item as sync_item_to_opensearch
-except ModuleNotFoundError:
-    from opensearch_items import sync_item as sync_item_to_opensearch
-
-try:
     from collector.opensearch_items import compact_item as compact_pg_item_after_sync
+    from collector.opensearch_items import fetch_document as fetch_opensearch_document
+    from collector.opensearch_items import index_item_document as index_item_document_to_opensearch
+    from collector.opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from collector.opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
     from collector.opensearch_items import delete_item as delete_opensearch_item
     from collector.opensearch_items import get_client as get_opensearch_query_client
     from collector.opensearch_items import get_items_index as get_opensearch_items_index
     from collector.opensearch_items import is_item_compacted as is_pg_item_compacted
 except ModuleNotFoundError:
     from opensearch_items import compact_item as compact_pg_item_after_sync
+    from opensearch_items import fetch_document as fetch_opensearch_document
+    from opensearch_items import index_item_document as index_item_document_to_opensearch
+    from opensearch_items import refresh_item_playback as refresh_item_playback_in_opensearch
+    from opensearch_items import upsert_item_record as upsert_item_record_with_opensearch
     from opensearch_items import delete_item as delete_opensearch_item
     from opensearch_items import get_client as get_opensearch_query_client
     from opensearch_items import get_items_index as get_opensearch_items_index
@@ -2479,62 +2482,41 @@ def insert_items(conn, target_row: dict, tweets: list[dict], previous_id: str | 
                 "source_instance": tweet.get("source_instance"),
                 "video_poster_url": tweet.get("video_poster_url"),
             }
+            stored_at = parse_datetime(tweet.get("stored_at")) or now_utc()
+            author = tweet.get("author")
+            fullname = tweet.get("fullname")
+            link = tweet.get("link")
+            x_url = tweet.get("x_url")
+            images = tweet.get("images", [])
+            video_url = tweet.get("video_url")
+            is_retweet = bool(tweet.get("is_retweet"))
 
-            cur.execute(
-                """
-                INSERT INTO items (
-                    target_id,
-                    guid,
-                    author,
-                    fullname,
-                    display_author,
-                    display_handle,
-                    author_profile_url,
-                    author_profile_platform,
-                    title,
-                    content,
-                    link,
-                    x_url,
-                    images,
-                    video_url,
-                    published_at,
-                    stored_at,
-                    is_retweet,
-                    metadata
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                )
-                ON CONFLICT (target_id, guid) DO NOTHING
-                RETURNING id
-                """,
-                (
-                    target_row["id"],
-                    tweet.get("guid"),
-                    tweet.get("author"),
-                    tweet.get("fullname"),
-                    presentation["display_author"],
-                    presentation["display_handle"],
-                    presentation["author_profile_url"],
-                    presentation["author_profile_platform"],
-                    title or None,
-                    tweet.get("content"),
-                    tweet.get("link"),
-                    tweet.get("x_url"),
-                    Jsonb(tweet.get("images", [])),
-                    tweet.get("video_url"),
-                    published_at,
-                    parse_datetime(tweet.get("stored_at")) or now_utc(),
-                    bool(tweet.get("is_retweet")),
-                    Jsonb(metadata),
-                ),
+            item_id, created = upsert_item_record_with_opensearch(
+                conn,
+                target_id=str(target_row["id"]),
+                guid=tweet.get("guid"),
+                display_author=presentation["display_author"],
+                display_handle=presentation["display_handle"],
+                author_profile_url=presentation["author_profile_url"],
+                author_profile_platform=presentation["author_profile_platform"],
+                video_url=video_url,
+                expires_at=None,
+                video_url_expires_at=None,
+                published_at=published_at,
+                stored_at=stored_at,
+                is_retweet=is_retweet,
+                metadata=metadata,
+                cover_url=tweet.get("video_poster_url"),
+                title=title or None,
+                caption=tweet.get("content"),
+                content=tweet.get("content"),
+                author=author,
+                fullname=fullname,
+                x_url=x_url,
+                link=link,
+                images=images,
             )
-            row = cur.fetchone()
-            if row and row.get("id"):
-                try:
-                    sync_item_to_opensearch(conn, str(row["id"]))
-                except Exception as exc:
-                    print(f"[opensearch] twitter item sync failed for {tweet.get('guid')}: {exc}")
+            if item_id and created:
                 inserted += 1
 
     return inserted
@@ -2979,53 +2961,33 @@ def upsert_resolved_youtube_item(conn, queue_row: dict, resolved: dict) -> str:
         "video_poster_url": payload.get("video_poster_url"),
         "video_url_expires_at": resolved["video_url_expires_at"].isoformat(),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                video_url = EXCLUDED.video_url,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                expires_at = EXCLUDED.expires_at,
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id
-            """,
-            (
-                queue_row["target_id"],
-                payload["guid"],
-                payload.get("author"),
-                payload.get("fullname"),
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                payload.get("title"),
-                payload.get("content"),
-                payload.get("link"),
-                Jsonb(payload.get("images") or []),
-                resolved["video_url"],
-                parse_datetime(payload["expires_at"]),
-                resolved["video_url_expires_at"],
-                parse_datetime(payload["published_at"]),
-                Jsonb(metadata),
-            ),
-        )
-        item_id = str(cur.fetchone()["id"])
-    try:
-        sync_item_to_opensearch(conn, item_id)
-    except Exception as exc:
-        print(f"[opensearch] youtube item sync failed for {payload.get('guid')}: {exc}")
+    item_id, _created = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(queue_row["target_id"]),
+        guid=payload["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=resolved["video_url"],
+        expires_at=parse_datetime(payload["expires_at"]),
+        video_url_expires_at=resolved["video_url_expires_at"],
+        published_at=parse_datetime(payload["published_at"]),
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=payload.get("video_poster_url"),
+        title=payload.get("title"),
+        caption=payload.get("content"),
+        content=payload.get("content"),
+        author=payload.get("author"),
+        fullname=payload.get("fullname"),
+        x_url=None,
+        link=payload.get("link"),
+        images=payload.get("images") or [],
+    )
+    if not item_id:
+        raise RuntimeError("failed to upsert resolved youtube item")
     return item_id
 
 
@@ -3542,59 +3504,32 @@ def upsert_heiliao_video_item(conn, target_row: dict, detail: dict, player: dict
         "resolved_at": now_iso(),
         "video_url_expires_at": verified["video_url_expires_at"].isoformat(),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                images = EXCLUDED.images,
-                video_url = EXCLUDED.video_url,
-                expires_at = EXCLUDED.expires_at,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id, (xmax = 0) AS inserted
-            """,
-            (
-                target_row["id"],
-                player["guid"],
-                HEILIAO_SITE_NAME,
-                HEILIAO_SITE_NAME,
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                player.get("video_title") or detail.get("title"),
-                content,
-                detail["url"],
-                Jsonb(images),
-                verified["video_url"],
-                expires_at,
-                verified["video_url_expires_at"],
-                published_at,
-                Jsonb(metadata),
-            ),
-        )
-        row = cur.fetchone()
-    if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] heiliao item sync failed for {player.get('guid')}: {exc}")
-    return bool(row and row.get("inserted"))
+    _item_id, inserted = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(target_row["id"]),
+        guid=player["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=verified["video_url"],
+        expires_at=expires_at,
+        video_url_expires_at=verified["video_url_expires_at"],
+        published_at=published_at,
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=detail.get("image"),
+        title=player.get("video_title") or detail.get("title"),
+        caption=content,
+        content=content,
+        author=HEILIAO_SITE_NAME,
+        fullname=HEILIAO_SITE_NAME,
+        x_url=None,
+        link=detail["url"],
+        images=images,
+    )
+    return inserted
 
 
 def monitor_heiliao_site(
@@ -3725,7 +3660,8 @@ def refresh_heiliao_playback_urls(conn, limit: int, refresh_window_minutes: int,
             seen_ids.add(row_id)
             processed += 1
             metadata = row["metadata"] or {}
-            source_url = metadata.get("source_url") or row.get("link")
+            source = fetch_opensearch_document(row_id)
+            source_url = metadata.get("source_url")
             video_id = metadata.get("heiliao_video_id")
             try:
                 if not source_url or not video_id:
@@ -3741,15 +3677,14 @@ def refresh_heiliao_playback_urls(conn, limit: int, refresh_window_minutes: int,
                     "video_url_expires_at": verified["video_url_expires_at"].isoformat(),
                     "date_modified": detail.get("modified_at").isoformat() if detail.get("modified_at") else metadata.get("date_modified"),
                 }
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE items
-                        SET video_url = %s, video_url_expires_at = %s, metadata = %s, stored_at = stored_at
-                        WHERE id = %s
-                        """,
-                        (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]),
-                    )
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    cover_url=detail.get("image") or source.get("cover_url"),
+                )
                 refreshed += 1
             except Exception as exc:
                 failed += 1
@@ -3976,59 +3911,32 @@ def upsert_cg91_video_item(conn, target_row: dict, detail: dict, player: dict, v
         "resolved_at": now_iso(),
         "video_url_expires_at": verified["video_url_expires_at"].isoformat(),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                images = EXCLUDED.images,
-                video_url = EXCLUDED.video_url,
-                expires_at = EXCLUDED.expires_at,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id, (xmax = 0) AS inserted
-            """,
-            (
-                target_row["id"],
-                player["guid"],
-                CG91_SITE_NAME,
-                CG91_SITE_NAME,
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                player.get("video_title") or detail.get("title"),
-                content,
-                detail["url"],
-                Jsonb(images),
-                verified["video_url"],
-                expires_at,
-                verified["video_url_expires_at"],
-                published_at,
-                Jsonb(metadata),
-            ),
-        )
-        row = cur.fetchone()
-    if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] cg91 item sync failed for {player.get('guid')}: {exc}")
-    return bool(row and row.get("inserted"))
+    _item_id, inserted = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(target_row["id"]),
+        guid=player["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=verified["video_url"],
+        expires_at=expires_at,
+        video_url_expires_at=verified["video_url_expires_at"],
+        published_at=published_at,
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=detail.get("image"),
+        title=player.get("video_title") or detail.get("title"),
+        caption=content,
+        content=content,
+        author=CG91_SITE_NAME,
+        fullname=CG91_SITE_NAME,
+        x_url=None,
+        link=detail["url"],
+        images=images,
+    )
+    return inserted
 
 
 def monitor_cg91_site(conn, *, base_url: str, max_pages: int, retention_hours: int, public_pool: bool, dry_run: bool = False) -> dict:
@@ -4135,7 +4043,7 @@ def refresh_cg91_playback_urls(conn, limit: int, refresh_window_minutes: int, cr
             seen_ids.add(row_id)
             processed += 1
             metadata = row["metadata"] or {}
-            source_url = metadata.get("source_url") or row.get("link")
+            source_url = metadata.get("source_url")
             video_id = metadata.get("cg91_video_id")
             try:
                 if not source_url or not video_id:
@@ -4146,12 +4054,14 @@ def refresh_cg91_playback_urls(conn, limit: int, refresh_window_minutes: int, cr
                     raise ValueError("matching player not found")
                 verified = verify_heiliao_hls_url(player["video_url"], detail["url"])
                 next_metadata = metadata | {"resolver": "cg91-dplayer", "resolved_at": now_iso(), "video_url_expires_at": verified["video_url_expires_at"].isoformat(), "date_modified": detail.get("modified_at").isoformat() if detail.get("modified_at") else metadata.get("date_modified")}
-                with conn.cursor() as cur:
-                    cur.execute("""UPDATE items SET video_url = %s, video_url_expires_at = %s, metadata = %s, stored_at = stored_at WHERE id = %s""", (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]))
-                try:
-                    sync_item_to_opensearch(conn, str(row["id"]))
-                except Exception as exc:
-                    print(f"[opensearch] cg91 refresh sync failed for {row['guid']}: {exc}")
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    cover_url=detail.get("image"),
+                )
                 refreshed += 1
             except Exception as exc:
                 failed += 1
@@ -4431,131 +4341,15 @@ def query_records(
     until: str | None,
     api_key: str | None,
 ) -> list[dict]:
-    if os.environ.get("OPENSEARCH_URL", "").strip():
-        return query_records_from_opensearch(
-            conn,
-            limit=limit,
-            target=target,
-            keyword=keyword,
-            since=since,
-            until=until,
-            api_key=api_key,
-        )
-
-    like_keyword = f"%{keyword.lower()}%" if keyword else None
-    normalized_target = target.lower() if target else None
-    since_dt = parse_datetime(since)
-    until_dt = parse_datetime(until)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                i.guid,
-                i.author,
-                i.fullname,
-                i.title,
-                i.content,
-                i.link,
-                i.x_url,
-                i.images,
-                i.video_url,
-                i.expires_at,
-                i.video_url_expires_at,
-                i.published_at,
-                i.stored_at,
-                i.is_retweet,
-                t.source,
-                t.kind,
-                t.value
-            FROM items i
-            INNER JOIN targets t ON t.id = i.target_id
-            WHERE (
-                %s::text IS NULL
-                OR EXISTS (
-                    SELECT 1
-                    FROM subscriptions s
-                    INNER JOIN clients c ON c.id = s.client_id
-                    WHERE s.target_id = i.target_id
-                      AND c.api_key = %s
-                      AND c.status = 'active'
-                )
-            )
-              AND (
-                %s::text IS NULL
-                OR LOWER(CASE
-                    WHEN t.source = 'youtube' THEN 'youtube:' || t.value
-                    WHEN t.source = 'heiliao' THEN 'heiliao:' || t.value
-                    WHEN t.source = 'cg91' THEN 'cg91:' || t.value
-                    WHEN t.source = 'baoliao51' THEN 'baoliao51:' || t.value
-                    WHEN t.source = 'douyin' THEN 'douyin:' || t.value
-                    WHEN t.source = '18mh' THEN '18mh:' || t.value
-                    WHEN t.source = 'rou' THEN 'rou:' || t.value
-                    WHEN t.source = 'dadaafa' THEN 'dadaafa:' || t.value
-                    WHEN t.source = '91porna' THEN '91porna:' || t.value
-                    WHEN t.source = '91porn' THEN '91porn:' || t.value
-                    WHEN t.source = '91rb' THEN '91rb:' || t.value
-                    WHEN t.source = 'avgood' THEN 'avgood:' || t.value
-                    WHEN t.source = '705hs' THEN '705hs:' || t.value
-                    WHEN t.source = 'xxxtik' THEN 'xxxtik:' || t.value
-                    WHEN t.source = 'affair' THEN 'affair:' || t.value
-                    WHEN t.source = 'dirtyship' THEN 'dirtyship:' || t.value
-                    WHEN t.source = 'influencersgonewild' THEN 'influencersgonewild:' || t.value
-                    WHEN t.source = 'missav' THEN 'missav:' || t.value
-                    WHEN t.source = '18j' THEN '18j:' || t.value
-                    WHEN t.kind = 'keyword' THEN 'search:' || t.value
-                    ELSE t.value
-                END) = %s
-              )
-              AND (
-                %s::text IS NULL
-                OR LOWER(COALESCE(i.content, '')) LIKE %s
-                OR LOWER(COALESCE(i.author, '')) LIKE %s
-              )
-              AND (%s::timestamptz IS NULL OR i.stored_at >= %s)
-              AND (%s::timestamptz IS NULL OR i.stored_at <= %s)
-            ORDER BY COALESCE(i.published_at, i.stored_at) DESC, i.stored_at DESC
-            LIMIT %s
-            """,
-            (
-                api_key,
-                api_key,
-                normalized_target,
-                normalized_target,
-                like_keyword,
-                like_keyword,
-                like_keyword,
-                since_dt,
-                since_dt,
-                until_dt,
-                until_dt,
-                limit,
-            ),
-        )
-        rows = cur.fetchall()
-
-    records = []
-    for row in rows:
-        records.append(
-            {
-                "target": format_target_row(row),
-                "author": row["author"],
-                "fullname": row["fullname"],
-                "guid": row["guid"],
-                "title": row["title"],
-                "content": row["content"],
-                "link": row["link"],
-                "x_url": row["x_url"],
-                "images": row["images"] or [],
-                "video_url": row["video_url"],
-                "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
-                "video_url_expires_at": row["video_url_expires_at"].isoformat() if row["video_url_expires_at"] else None,
-                "published_at": row["published_at"].isoformat() if row["published_at"] else None,
-                "stored_at": row["stored_at"].isoformat() if row["stored_at"] else None,
-                "is_retweet": row["is_retweet"],
-            }
-        )
-    return records
+    return query_records_from_opensearch(
+        conn,
+        limit=limit,
+        target=target,
+        keyword=keyword,
+        since=since,
+        until=until,
+        api_key=api_key,
+    )
 
 
 def print_record(record: dict, index: int | None = None) -> None:
@@ -4808,59 +4602,32 @@ def upsert_douyin_video_item(conn, target_row: dict, item: dict, verified: dict,
         "resolved_at": now_iso(),
         "video_url_expires_at": verified["video_url_expires_at"].isoformat(),
     }
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO items (
-                target_id, guid, author, fullname,
-                display_author, display_handle, author_profile_url, author_profile_platform,
-                title, content,
-                link, x_url, images, video_url, expires_at, video_url_expires_at,
-                published_at, stored_at, is_retweet, metadata
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, NOW(), FALSE, %s)
-            ON CONFLICT (target_id, guid) DO UPDATE SET
-                display_author = EXCLUDED.display_author,
-                display_handle = EXCLUDED.display_handle,
-                author_profile_url = EXCLUDED.author_profile_url,
-                author_profile_platform = EXCLUDED.author_profile_platform,
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                images = EXCLUDED.images,
-                video_url = EXCLUDED.video_url,
-                expires_at = EXCLUDED.expires_at,
-                video_url_expires_at = EXCLUDED.video_url_expires_at,
-                published_at = COALESCE(items.published_at, EXCLUDED.published_at),
-                metadata = items.metadata || EXCLUDED.metadata
-            RETURNING id, (xmax = 0) AS inserted
-            """,
-            (
-                target_row["id"],
-                item["guid"],
-                DOUYIN_SITE_NAME,
-                DOUYIN_SITE_NAME,
-                presentation["display_author"],
-                presentation["display_handle"],
-                presentation["author_profile_url"],
-                presentation["author_profile_platform"],
-                item.get("title"),
-                content,
-                item["source_url"],
-                Jsonb(images),
-                verified["video_url"],
-                expires_at,
-                verified["video_url_expires_at"],
-                published_at,
-                Jsonb(metadata),
-            ),
-        )
-        row = cur.fetchone()
-    if row and row.get("id"):
-        try:
-            sync_item_to_opensearch(conn, str(row["id"]))
-        except Exception as exc:
-            print(f"[opensearch] douyin item sync failed for {item.get('guid')}: {exc}")
-    return bool(row and row.get("inserted"))
+    _item_id, inserted = upsert_item_record_with_opensearch(
+        conn,
+        target_id=str(target_row["id"]),
+        guid=item["guid"],
+        display_author=presentation["display_author"],
+        display_handle=presentation["display_handle"],
+        author_profile_url=presentation["author_profile_url"],
+        author_profile_platform=presentation["author_profile_platform"],
+        video_url=verified["video_url"],
+        expires_at=expires_at,
+        video_url_expires_at=verified["video_url_expires_at"],
+        published_at=published_at,
+        stored_at=now_utc(),
+        is_retweet=False,
+        metadata=metadata,
+        cover_url=item.get("image"),
+        title=item.get("title"),
+        caption=content,
+        content=content,
+        author=DOUYIN_SITE_NAME,
+        fullname=DOUYIN_SITE_NAME,
+        x_url=None,
+        link=item["source_url"],
+        images=images,
+    )
+    return inserted
 
 
 def monitor_douyin_site(conn, *, base_url: str, max_pages: int, retention_hours: int, public_pool: bool, dry_run: bool = False) -> dict:
@@ -4967,12 +4734,14 @@ def refresh_douyin_playback_urls(conn, limit: int, refresh_window_minutes: int, 
                     "selected_link": verified.get("selected_link"),
                     "video_url_expires_at": verified["video_url_expires_at"].isoformat(),
                 }
-                with conn.cursor() as cur:
-                    cur.execute("""UPDATE items SET video_url = %s, video_url_expires_at = %s, metadata = %s, stored_at = stored_at WHERE id = %s""", (verified["video_url"], verified["video_url_expires_at"], Jsonb(next_metadata), row["id"]))
-                try:
-                    sync_item_to_opensearch(conn, str(row["id"]))
-                except Exception as exc:
-                    print(f"[opensearch] douyin refresh sync failed for {row['guid']}: {exc}")
+                refresh_item_playback_in_opensearch(
+                    conn,
+                    item_id=row_id,
+                    video_url=verified["video_url"],
+                    video_url_expires_at=verified["video_url_expires_at"],
+                    metadata=next_metadata,
+                    cover_url=detail_item.get("image") or metadata.get("video_poster_url"),
+                )
                 refreshed += 1
             except Exception as exc:
                 failed += 1

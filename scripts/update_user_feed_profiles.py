@@ -20,6 +20,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from collector.opensearch_items import fetch_documents  # noqa: E402
+
 try:
     from collector.redis_state import RedisLock, namespaced_key, redis_client, release_lock_safely
 except Exception:  # pragma: no cover - Redis is optional for local dry-runs
@@ -61,11 +63,10 @@ MAX_FEATURES = {
 PROFILE_SQL = """
 SELECT
   fe.client_id::text AS client_id,
+  fe.item_id::text AS item_id,
   fe.event_type,
   fe.watch_ms,
   fe.created_at,
-  COALESCE(NULLIF(i.metadata->>'item_author', ''), i.author) AS author,
-  COALESCE(NULLIF(i.metadata->>'item_fullname', ''), i.fullname) AS fullname,
   t.source,
   CASE
     WHEN t.source = 'youtube' THEN 'youtube:' || t.value
@@ -310,11 +311,18 @@ def profile_payload(state: ClientProfileState) -> dict[str, Any]:
 
 
 def build_profiles(rows: list[dict[str, Any]], now: datetime) -> dict[str, ClientProfileState]:
+    documents = fetch_documents(row["item_id"] for row in rows)
     profiles: dict[str, ClientProfileState] = {}
     for row in rows:
+        source = documents.get(str(row["item_id"])) or {}
+        materialized_row = {
+            **row,
+            "author": source.get("author"),
+            "fullname": source.get("fullname"),
+        }
         client_id = row["client_id"]
         state = profiles.setdefault(client_id, ClientProfileState(client_id=client_id))
-        weight = event_weight(row)
+        weight = event_weight(materialized_row)
         if weight == 0:
             continue
 
@@ -330,16 +338,16 @@ def build_profiles(rows: list[dict[str, Any]], now: datetime) -> dict[str, Clien
         if weight > 0:
             state.positive_count += 1
             if age_days <= 1:
-                add_row_to_bucket(state.short_1d, row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["short_1d"]))
+                add_row_to_bucket(state.short_1d, materialized_row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["short_1d"]))
             if age_days <= 3:
-                add_row_to_bucket(state.short_3d, row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["short_3d"]))
+                add_row_to_bucket(state.short_3d, materialized_row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["short_3d"]))
             if age_days <= 30:
-                add_row_to_bucket(state.long_30d, row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["long_30d"]))
-            add_row_to_bucket(state.long_90d, row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["long_90d"]))
+                add_row_to_bucket(state.long_30d, materialized_row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["long_30d"]))
+            add_row_to_bucket(state.long_90d, materialized_row, weight * decay_factor(created_at, now, HALF_LIFE_HOURS["long_90d"]))
         else:
             state.negative_count += 1
             if age_days <= 30:
-                add_row_to_bucket(state.negative_30d, row, abs(weight) * decay_factor(created_at, now, HALF_LIFE_HOURS["negative_30d"]))
+                add_row_to_bucket(state.negative_30d, materialized_row, abs(weight) * decay_factor(created_at, now, HALF_LIFE_HOURS["negative_30d"]))
 
     return profiles
 
