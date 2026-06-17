@@ -123,19 +123,6 @@ CREATE TABLE IF NOT EXISTS items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
     guid TEXT NOT NULL,
-    author TEXT,
-    fullname TEXT,
-    display_author TEXT,
-    display_handle TEXT,
-    author_profile_url TEXT,
-    author_profile_platform TEXT,
-    title TEXT,
-    content TEXT,
-    raw_content TEXT,
-    translated_content TEXT,
-    link TEXT,
-    x_url TEXT,
-    images JSONB NOT NULL DEFAULT '[]'::jsonb,
     video_url TEXT,
     expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
     video_url_expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
@@ -149,16 +136,25 @@ CREATE TABLE IF NOT EXISTS items (
 
 ALTER TABLE items ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00';
 ALTER TABLE items ADD COLUMN IF NOT EXISTS video_url_expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00';
-ALTER TABLE items ADD COLUMN IF NOT EXISTS display_author TEXT;
-ALTER TABLE items ADD COLUMN IF NOT EXISTS display_handle TEXT;
-ALTER TABLE items ADD COLUMN IF NOT EXISTS author_profile_url TEXT;
-ALTER TABLE items ADD COLUMN IF NOT EXISTS author_profile_platform TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 UPDATE items
 SET updated_at = COALESCE(updated_at, stored_at, NOW())
 WHERE updated_at IS NULL;
 ALTER TABLE items ALTER COLUMN updated_at SET DEFAULT NOW();
 ALTER TABLE items ALTER COLUMN updated_at SET NOT NULL;
+ALTER TABLE items DROP COLUMN IF EXISTS author;
+ALTER TABLE items DROP COLUMN IF EXISTS fullname;
+ALTER TABLE items DROP COLUMN IF EXISTS display_author;
+ALTER TABLE items DROP COLUMN IF EXISTS display_handle;
+ALTER TABLE items DROP COLUMN IF EXISTS author_profile_url;
+ALTER TABLE items DROP COLUMN IF EXISTS author_profile_platform;
+ALTER TABLE items DROP COLUMN IF EXISTS title;
+ALTER TABLE items DROP COLUMN IF EXISTS content;
+ALTER TABLE items DROP COLUMN IF EXISTS raw_content;
+ALTER TABLE items DROP COLUMN IF EXISTS translated_content;
+ALTER TABLE items DROP COLUMN IF EXISTS link;
+ALTER TABLE items DROP COLUMN IF EXISTS x_url;
+ALTER TABLE items DROP COLUMN IF EXISTS images;
 
 CREATE OR REPLACE FUNCTION x2_twitter_username(raw_value TEXT)
 RETURNS TEXT AS $$
@@ -377,82 +373,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
-CREATE OR REPLACE FUNCTION x2_set_item_author_presentation()
-RETURNS TRIGGER AS $$
-DECLARE
-    target_source TEXT;
-    target_kind TEXT;
-    target_value TEXT;
-    username TEXT;
-    profile_url TEXT;
-BEGIN
-    SELECT source, kind, value
-    INTO target_source, target_kind, target_value
-    FROM targets
-    WHERE id = NEW.target_id;
-
-    target_source := x2_normalized_source(target_source);
-
-    NEW.display_author := COALESCE(
-        NULLIF(BTRIM(COALESCE(NEW.fullname, '')), ''),
-        NULLIF(BTRIM(COALESCE(NEW.author, '')), ''),
-        NULLIF(BTRIM(COALESCE(target_value, '')), ''),
-        x2_source_display_name(target_source)
-    );
-
-    IF target_source = 'twitter' THEN
-        username := COALESCE(
-            x2_twitter_username(NEW.author),
-            x2_twitter_username(target_value),
-            x2_twitter_username(NEW.x_url),
-            x2_twitter_username(NEW.link)
-        );
-        NEW.display_handle := CASE
-            WHEN NULLIF(BTRIM(COALESCE(NEW.fullname, '')), '') IS NOT NULL AND username IS NOT NULL
-            THEN '@' || username
-            ELSE NULL
-        END;
-        NEW.author_profile_url := CASE WHEN username IS NOT NULL THEN 'https://x.com/' || username ELSE NULL END;
-        NEW.author_profile_platform := CASE WHEN username IS NOT NULL THEN 'X' ELSE NULL END;
-    ELSIF target_source = 'youtube' THEN
-        profile_url := COALESCE(
-            x2_youtube_profile_url('youtube:' || COALESCE(target_value, '')),
-            x2_youtube_profile_url(NEW.link)
-        );
-        NEW.display_handle := NULL;
-        NEW.author_profile_url := profile_url;
-        NEW.author_profile_platform := CASE WHEN profile_url IS NOT NULL THEN 'YouTube' ELSE NULL END;
-    ELSIF target_source = 'douyin' THEN
-        profile_url := x2_douyin_detail_url(target_value, NEW.metadata->>'douyin_video_id');
-        IF profile_url IS NOT NULL THEN
-            NEW.link := profile_url;
-        ELSE
-            profile_url := x2_http_url(NEW.link);
-        END IF;
-        NEW.display_handle := NULL;
-        NEW.author_profile_url := profile_url;
-        NEW.author_profile_platform := CASE WHEN profile_url IS NOT NULL THEN x2_source_display_name(target_source) ELSE NULL END;
-    ELSIF target_source IN ('heiliao', 'cg91', 'baoliao51', '18mh', 'rou', 'dadaafa', '18j', '1mtif', 'tikporn', '91porna', '91porn', '91rb', 'badnews', 'bdrq', 'avgood', '705hs', 'xxxtik', 'affair', 'attach', 'dirtyship', 'influencersgonewild', 'missav') THEN
-        profile_url := x2_http_url(NEW.link);
-        NEW.display_handle := NULL;
-        NEW.author_profile_url := profile_url;
-        NEW.author_profile_platform := CASE WHEN profile_url IS NOT NULL THEN x2_source_display_name(target_source) ELSE NULL END;
-    ELSE
-        NEW.display_handle := NULL;
-        NEW.author_profile_url := NULL;
-        NEW.author_profile_platform := NULL;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
 DROP TRIGGER IF EXISTS trg_items_author_presentation ON items;
-CREATE TRIGGER trg_items_author_presentation
-BEFORE INSERT OR UPDATE OF target_id, author, fullname, link, x_url
-ON items
-FOR EACH ROW
-EXECUTE FUNCTION x2_set_item_author_presentation();
+DROP FUNCTION IF EXISTS x2_set_item_author_presentation();
 
 CREATE INDEX IF NOT EXISTS idx_targets_kind_value ON targets (kind, normalized_value);
 CREATE INDEX IF NOT EXISTS idx_targets_source_kind_value ON targets (source, kind, normalized_value);
