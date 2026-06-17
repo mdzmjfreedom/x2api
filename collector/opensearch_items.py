@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Iterable
 from urllib.parse import urlparse
 
@@ -19,6 +20,7 @@ _INDEX = None
 _TARGET_CONTEXT_CACHE: dict[str, dict] = {}
 _UNSET = object()
 X2_ITEMS_INDEX = "x2_items"
+STABLE_EXPIRY = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 
 def is_opensearch_write_enabled() -> bool:
@@ -72,6 +74,14 @@ def _to_iso(value):
         return value.isoformat()
     except AttributeError:
         return str(value)
+
+
+def _resolve_expiry(value, *, fallback=None):
+    if value is not None:
+        return value
+    if fallback is not None:
+        return fallback
+    return STABLE_EXPIRY
 
 
 def _normalize_tags(values):
@@ -405,6 +415,8 @@ def upsert_item_record(
     images: list[str] | None,
     playback_headers: dict | None = None,
 ) -> tuple[str | None, bool]:
+    resolved_expires_at = _resolve_expiry(expires_at)
+    resolved_video_url_expires_at = _resolve_expiry(video_url_expires_at, fallback=resolved_expires_at)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
@@ -426,8 +438,8 @@ def upsert_item_record(
                 target_id,
                 guid,
                 video_url,
-                expires_at,
-                video_url_expires_at,
+                resolved_expires_at,
+                resolved_video_url_expires_at,
                 published_at,
                 stored_at,
                 is_retweet,
@@ -463,8 +475,8 @@ def upsert_item_record(
         published_at=published_at,
         stored_at=stored_at,
         updated_at=stored_at,
-        expires_at=expires_at,
-        video_url_expires_at=video_url_expires_at,
+        expires_at=resolved_expires_at,
+        video_url_expires_at=resolved_video_url_expires_at,
         is_retweet=is_retweet,
     )
     return item_id, bool(row.get("inserted"))
