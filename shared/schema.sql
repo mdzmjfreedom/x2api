@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS items (
     video_url_expires_at TIMESTAMPTZ NOT NULL DEFAULT '2099-12-31 23:59:59+00',
     published_at TIMESTAMPTZ,
     stored_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     is_retweet BOOLEAN NOT NULL DEFAULT FALSE,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     UNIQUE (target_id, guid)
@@ -152,6 +153,12 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS display_author TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS display_handle TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS author_profile_url TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS author_profile_platform TEXT;
+ALTER TABLE items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+UPDATE items
+SET updated_at = COALESCE(updated_at, stored_at, NOW())
+WHERE updated_at IS NULL;
+ALTER TABLE items ALTER COLUMN updated_at SET DEFAULT NOW();
+ALTER TABLE items ALTER COLUMN updated_at SET NOT NULL;
 
 CREATE OR REPLACE FUNCTION x2_twitter_username(raw_value TEXT)
 RETURNS TEXT AS $$
@@ -453,6 +460,7 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_client_id ON subscriptions (client_
 CREATE INDEX IF NOT EXISTS idx_subscriptions_target_id ON subscriptions (target_id);
 CREATE INDEX IF NOT EXISTS idx_items_target_id_stored_at ON items (target_id, stored_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_stored_at ON items (stored_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_updated_at_id ON items (updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_items_published_at ON items (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_video_feed ON items (stored_at DESC) WHERE video_url IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_items_video_feed_sort_time
@@ -636,6 +644,12 @@ EXECUTE FUNCTION set_updated_at();
 DROP TRIGGER IF EXISTS set_targets_updated_at ON targets;
 CREATE TRIGGER set_targets_updated_at
 BEFORE UPDATE ON targets
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS set_items_updated_at ON items;
+CREATE TRIGGER set_items_updated_at
+BEFORE UPDATE ON items
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
 

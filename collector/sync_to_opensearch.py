@@ -14,10 +14,12 @@ Options:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -32,6 +34,8 @@ from opensearchpy import OpenSearch, helpers
 
 X2_ITEMS_INDEX = "x2_items"
 X2_SYNC_META_INDEX = "x2_sync_meta"
+ITEMS_SYNC_META_KEY = "last_sync_v2"
+STATS_SYNC_META_KEY = "last_stats_sync_v2"
 
 X2_ITEMS_MAPPING = {
     "settings": {
@@ -72,6 +76,7 @@ X2_ITEMS_MAPPING = {
             "link": {"type": "keyword", "index": False, "doc_values": False},
             "published_at": {"type": "date"},
             "stored_at": {"type": "date"},
+            "updated_at": {"type": "date"},
             "sort_at": {"type": "date"},
             "source": {"type": "keyword", "normalizer": "lowercase_keyword"},
             "target": {"type": "keyword", "normalizer": "lowercase_keyword"},
@@ -231,6 +236,69 @@ def dt_to_iso(val):
     return str(val)
 
 
+def shard_sql_filter(column_name: str) -> str:
+    return f"MOD(hashtext({column_name}::text)::bigint + 2147483648, %s::int) = %s::int"
+
+
+def validate_shard_args(shard_index: int, shard_count: int) -> None:
+    if shard_count <= 0:
+        raise ValueError("shard_count must be a positive integer.")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("shard_index must be between 0 and shard_count - 1.")
+
+
+def sync_scope_suffix(shard_index: int, shard_count: int) -> str:
+    return f"shard_{shard_index}_of_{shard_count}"
+
+
+def sync_meta_key(base_key: str, shard_index: int, shard_count: int) -> str:
+    return f"{base_key}_{sync_scope_suffix(shard_index, shard_count)}"
+
+
+def stable_shard(value: str, shard_count: int) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) % shard_count
+
+
+def advisory_lock_key(lock_name: str) -> int:
+    digest = hashlib.sha256(lock_name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+
+
+def try_acquire_db_lock(conn: psycopg.Connection, lock_name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s) AS locked", (advisory_lock_key(lock_name),))
+        row = cur.fetchone()
+    return bool(row and row["locked"])
+
+
+def release_db_lock(conn: psycopg.Connection, lock_name: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (advisory_lock_key(lock_name),))
+
+
+@contextmanager
+def sync_run_lock(db_url: str, lock_name: str):
+    conn = psycopg.connect(db_url, row_factory=dict_row)
+    acquired = False
+    try:
+        acquired = try_acquire_db_lock(conn, lock_name)
+        if acquired:
+            print(f"Acquired sync lock: {lock_name}")
+            yield True
+        else:
+            print(f"Another sync run already holds lock '{lock_name}', skipping.")
+            yield False
+    finally:
+        if acquired:
+            try:
+                release_db_lock(conn, lock_name)
+                print(f"Released sync lock: {lock_name}")
+            except Exception as exc:
+                print(f"WARNING: Failed to release sync lock '{lock_name}': {exc}", file=sys.stderr)
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Helper: merge tags from item_tags_array + profile_tags
 # ---------------------------------------------------------------------------
@@ -307,6 +375,7 @@ def build_document(row):
         "link": row["link"],
         "published_at": dt_to_iso(row["published_at"]),
         "stored_at": dt_to_iso(row["stored_at"]),
+        "updated_at": dt_to_iso(row["updated_at"]),
         "sort_at": dt_to_iso(row["published_at"] or row["stored_at"]),
         "source": source,
         "target": compute_target_display(source, kind, target_value),
@@ -458,6 +527,7 @@ SELECT
   i.link,
   i.published_at,
   i.stored_at,
+  i.updated_at,
   t.source,
   t.kind,
   t.value as target_value,
@@ -510,19 +580,20 @@ WHERE (vs.updated_at > %s OR (vs.updated_at = %s AND i.id::text > %s))
   AND (
     t.source NOT IN ('youtube', 'heiliao', 'cg91', 'baoliao51', 'douyin', '18mh', 'rou', 'dadaafa', '18j', '1mtif', 'tikporn', '91porna', '91porn', '91rb', 'badnews', 'bdrq', 'avgood', '705hs', 'xxxtik', 'affair', 'attach', 'dirtyship', 'influencersgonewild', 'missav')
     OR i.video_url_expires_at > NOW() + INTERVAL '10 minutes'
-  )
-ORDER BY vs.updated_at ASC, i.id ASC"""
+  )"""
 
 
 # ---------------------------------------------------------------------------
 # Sync: items (full or incremental)
 # ---------------------------------------------------------------------------
 
-def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None):
+def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None, shard_index: int, shard_count: int):
+    validate_shard_args(shard_index, shard_count)
+    meta_key = sync_meta_key(ITEMS_SYNC_META_KEY, shard_index, shard_count)
     last_sync_ts = None
     last_sync_item_id = None
     if not full:
-        last_sync_ts, last_sync_item_id = get_last_sync_checkpoint(os_client)
+        last_sync_ts, last_sync_item_id = get_last_sync_checkpoint(os_client, meta_key=meta_key)
         if last_sync_ts:
             print(f"Incremental sync from: {last_sync_ts}")
         else:
@@ -532,10 +603,13 @@ def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None
     params: list = []
 
     if not full and last_sync_ts:
-        sql += "\n  AND (i.stored_at > %s OR (i.stored_at = %s AND i.id::text > %s))"
+        sql += "\n  AND (i.updated_at > %s OR (i.updated_at = %s AND i.id::text > %s))"
         params.extend([last_sync_ts, last_sync_ts, last_sync_item_id or ""])
 
-    sql += "\nORDER BY i.stored_at ASC, i.id ASC"
+    sql += f"\n  AND ({shard_sql_filter('i.id')})"
+    params.extend([shard_count, shard_index])
+
+    sql += "\nORDER BY i.updated_at ASC, i.id ASC"
 
     if limit:
         sql += "\nLIMIT %s"
@@ -564,7 +638,8 @@ def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None
 
     # Build actions for bulk indexing
     total_synced = 0
-    last_stored_at = None
+    total_errors = 0
+    last_updated_at = None
     last_item_id = None
     batch_size = 500
     t_sync = time.time()
@@ -580,12 +655,13 @@ def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None
                 "_id": str(row["id"]),
                 "_source": doc,
             })
-            if row["stored_at"]:
-                last_stored_at = row["stored_at"]
+            if row["updated_at"]:
+                last_updated_at = row["updated_at"]
                 last_item_id = str(row["id"])
 
         success, errors = helpers.bulk(os_client, actions, raise_on_error=False)
         total_synced += success
+        total_errors += len(errors)
         if errors:
             print(f"  Batch {batch_start // batch_size + 1}: {success} ok, {len(errors)} errors")
             for err in errors[:5]:
@@ -596,10 +672,12 @@ def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None
     sync_time = time.time() - t_sync
 
     # Persist last sync timestamp
-    if last_stored_at:
-        ts_iso = dt_to_iso(last_stored_at)
-        set_last_sync_timestamp(os_client, ts_iso, item_id=last_item_id)
+    if total_errors == 0 and last_updated_at:
+        ts_iso = dt_to_iso(last_updated_at)
+        set_last_sync_timestamp(os_client, ts_iso, meta_key=meta_key, item_id=last_item_id)
         print(f"Last sync timestamp saved: {ts_iso}")
+    elif total_errors:
+        print("Item sync checkpoint not advanced because some OpenSearch writes failed.")
 
     total_time = time.time() - t0
     print(f"\nSync complete: {total_synced} items indexed in {sync_time:.1f}s (total {total_time:.1f}s)")
@@ -609,8 +687,10 @@ def sync_items(os_client: OpenSearch, db_url: str, full: bool, limit: int | None
 # Sync: stats only
 # ---------------------------------------------------------------------------
 
-def sync_stats(os_client: OpenSearch, db_url: str, limit: int | None):
-    last_sync_ts, last_sync_item_id = get_last_sync_checkpoint(os_client, meta_key="last_stats_sync")
+def sync_stats(os_client: OpenSearch, db_url: str, limit: int | None, shard_index: int, shard_count: int):
+    validate_shard_args(shard_index, shard_count)
+    meta_key = sync_meta_key(STATS_SYNC_META_KEY, shard_index, shard_count)
+    last_sync_ts, last_sync_item_id = get_last_sync_checkpoint(os_client, meta_key=meta_key)
     if last_sync_ts:
         print(f"Stats incremental from: {last_sync_ts}")
     else:
@@ -619,6 +699,9 @@ def sync_stats(os_client: OpenSearch, db_url: str, limit: int | None):
 
     sql = STATS_SQL
     params: list = [last_sync_ts, last_sync_ts, last_sync_item_id or ""]
+    sql += f"\n  AND ({shard_sql_filter('i.id')})"
+    params.extend([shard_count, shard_index])
+    sql += "\nORDER BY vs.updated_at ASC, i.id ASC"
     if limit:
         sql += "\nLIMIT %s"
         params.append(limit)
@@ -689,7 +772,7 @@ def sync_stats(os_client: OpenSearch, db_url: str, limit: int | None):
 
     if total_errors == 0 and last_updated_at:
         ts_iso = dt_to_iso(last_updated_at)
-        set_last_sync_timestamp(os_client, ts_iso, meta_key="last_stats_sync", item_id=last_item_id)
+        set_last_sync_timestamp(os_client, ts_iso, meta_key=meta_key, item_id=last_item_id)
         print(f"Stats sync timestamp saved: {ts_iso}")
     elif total_errors:
         print("Stats sync checkpoint not advanced because some OpenSearch documents were missing.")
@@ -702,7 +785,8 @@ def sync_stats(os_client: OpenSearch, db_url: str, limit: int | None):
 # Sync: prune deleted PostgreSQL rows from OpenSearch
 # ---------------------------------------------------------------------------
 
-def prune_deleted(os_client: OpenSearch, db_url: str, limit: int | None):
+def prune_deleted(os_client: OpenSearch, db_url: str, limit: int | None, shard_index: int, shard_count: int):
+    validate_shard_args(shard_index, shard_count)
     print("Scanning OpenSearch docs for deleted PostgreSQL items...")
     t0 = time.time()
 
@@ -751,7 +835,10 @@ def prune_deleted(os_client: OpenSearch, db_url: str, limit: int | None):
             size=batch_size,
             preserve_order=False,
         ):
-            pending_ids.append(str(hit["_id"]))
+            item_id = str(hit["_id"])
+            if stable_shard(item_id, shard_count) != shard_index:
+                continue
+            pending_ids.append(item_id)
             scanned += 1
             if len(pending_ids) >= batch_size:
                 deleted += flush(pending_ids)
@@ -776,6 +863,8 @@ def main():
     parser.add_argument("--prune-deleted", action="store_true", help="Delete OpenSearch docs whose PostgreSQL item no longer exists")
     parser.add_argument("--reset-checkpoint", action="store_true", help="Reset the item sync checkpoint before syncing")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of items to sync")
+    parser.add_argument("--shard-index", type=int, default=int(os.environ.get("OPENSEARCH_SYNC_SHARD_INDEX", "0")), help="Shard index for parallel sync workers")
+    parser.add_argument("--shard-count", type=int, default=int(os.environ.get("OPENSEARCH_SYNC_SHARD_COUNT", "1")), help="Total number of sync shards")
     args = parser.parse_args()
 
     db_url = os.environ.get("DATABASE_URL")
@@ -786,6 +875,11 @@ def main():
         sys.exit(1)
     if not opensearch_url:
         print("ERROR: OPENSEARCH_URL environment variable is required.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        validate_shard_args(args.shard_index, args.shard_count)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # Create OpenSearch client
@@ -803,14 +897,25 @@ def main():
     ensure_indices(os_client)
 
     if args.reset_checkpoint:
-        reset_sync_checkpoint(os_client, "last_sync")
+        reset_sync_checkpoint(os_client, sync_meta_key(ITEMS_SYNC_META_KEY, args.shard_index, args.shard_count))
+        if args.stats_only:
+            reset_sync_checkpoint(os_client, sync_meta_key(STATS_SYNC_META_KEY, args.shard_index, args.shard_count))
 
     if args.prune_deleted:
-        prune_deleted(os_client, db_url, args.limit)
+        lock_name = f"os-prune-{sync_scope_suffix(args.shard_index, args.shard_count)}"
+        with sync_run_lock(db_url, lock_name) as acquired:
+            if acquired:
+                prune_deleted(os_client, db_url, args.limit, args.shard_index, args.shard_count)
     elif args.stats_only:
-        sync_stats(os_client, db_url, args.limit)
+        lock_name = f"os-stats-{sync_scope_suffix(args.shard_index, args.shard_count)}"
+        with sync_run_lock(db_url, lock_name) as acquired:
+            if acquired:
+                sync_stats(os_client, db_url, args.limit, args.shard_index, args.shard_count)
     else:
-        sync_items(os_client, db_url, args.full, args.limit)
+        lock_name = f"os-items-{sync_scope_suffix(args.shard_index, args.shard_count)}"
+        with sync_run_lock(db_url, lock_name) as acquired:
+            if acquired:
+                sync_items(os_client, db_url, args.full, args.limit, args.shard_index, args.shard_count)
 
 
 if __name__ == "__main__":

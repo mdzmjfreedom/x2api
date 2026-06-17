@@ -43,8 +43,47 @@ on:
         default: '120'
 
 jobs:
-  maintain:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      shard_matrix: ${{ steps.matrix.outputs.shard_matrix }}
+      shard_count: ${{ steps.matrix.outputs.shard_count }}
+
+    steps:
+      - name: Build sync shard matrix
+        id: matrix
+        env:
+          INPUT_SHARD_COUNT: ${{ vars.OPENSEARCH_SYNC_SHARD_COUNT || '1' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          raw_count = (os.environ.get("INPUT_SHARD_COUNT") or "1").strip()
+          try:
+              shard_count = int(raw_count)
+          except ValueError:
+              shard_count = 1
+
+          if shard_count <= 0:
+              shard_count = 1
+
+          matrix = {"shard": list(range(shard_count))}
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as fh:
+              fh.write(f"shard_matrix={json.dumps(matrix)}\n")
+              fh.write(f"shard_count={shard_count}\n")
+          PY
+
+  maintain:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.shard_matrix) }}
+    concurrency:
+      group: ${{ github.workflow }}-shard-${{ matrix.shard }}-of-${{ needs.prepare.outputs.shard_count }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout code
@@ -88,6 +127,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          OPENSEARCH_SYNC_SHARD_INDEX: ${{ matrix.shard }}
+          OPENSEARCH_SYNC_SHARD_COUNT: ${{ needs.prepare.outputs.shard_count }}
         run: |
           python collector/sync_to_opensearch.py
 
@@ -97,6 +138,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          OPENSEARCH_SYNC_SHARD_INDEX: ${{ matrix.shard }}
+          OPENSEARCH_SYNC_SHARD_COUNT: ${{ needs.prepare.outputs.shard_count }}
         run: |
           python collector/sync_to_opensearch.py --stats-only
 
@@ -130,6 +173,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          OPENSEARCH_SYNC_SHARD_INDEX: ${{ matrix.shard }}
+          OPENSEARCH_SYNC_SHARD_COUNT: ${{ needs.prepare.outputs.shard_count }}
         run: |
           python collector/sync_to_opensearch.py --prune-deleted
 
