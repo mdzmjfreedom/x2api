@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+from pathlib import Path
 from urllib.parse import urlparse
 
 import psycopg
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from collector.opensearch_items import delete_items, delete_items_by_source
 
