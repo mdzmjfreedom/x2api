@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import psycopg
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-columns", action="store_true", help="Drop raw_content / translated_content after sync succeeds.")
     parser.add_argument("--reset-checkpoint", action="store_true", help="Reset item sync checkpoint before syncing.")
     parser.add_argument("--limit", type=int, default=None, help="Optional item sync limit for testing.")
+    parser.add_argument("--retries", type=int, default=5, help="Retry count for flaky PostgreSQL/OpenSearch alignment steps.")
+    parser.add_argument("--retry-delay-seconds", type=float, default=5.0, help="Base delay between retries.")
     return parser.parse_args()
 
 
@@ -49,6 +52,20 @@ def existing_target_columns(conn: psycopg.Connection) -> list[str]:
             (list(TARGET_COLUMNS),),
         )
         return [row["column_name"] for row in cur.fetchall()]
+
+
+def run_with_retry(label: str, retries: int, retry_delay_seconds: float, fn):
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn()
+        except Exception:
+            if attempt >= retries:
+                raise
+            delay = retry_delay_seconds * attempt
+            print(f"{label} failed on attempt {attempt}/{retries}; retrying in {delay:.1f}s...", file=sys.stderr)
+            time.sleep(delay)
 
 
 def ensure_updated_at(conn: psycopg.Connection) -> None:
@@ -84,20 +101,32 @@ def main() -> int:
     if args.reset_checkpoint:
         reset_sync_checkpoint(client, "last_sync_v2")
 
-    with psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None) as conn:
-        ensure_updated_at(conn)
-        conn.commit()
+    def ensure_pg_updated_at():
+        with psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None) as conn:
+            ensure_updated_at(conn)
+            conn.commit()
 
-    sync_items(client, db_url, full=True, limit=args.limit, shard_index=0, shard_count=1)
+    run_with_retry("ensure_updated_at", args.retries, args.retry_delay_seconds, ensure_pg_updated_at)
+
+    run_with_retry(
+        "sync_items",
+        args.retries,
+        args.retry_delay_seconds,
+        lambda: sync_items(client, db_url, full=True, limit=args.limit, shard_index=0, shard_count=1),
+    )
 
     if not args.drop_columns:
         print("Alignment completed. Target columns were not dropped.")
         return 0
 
-    with psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None) as conn:
-        dropped = drop_target_columns(conn)
-        conn.commit()
-        print(f"Dropped columns: {', '.join(dropped) if dropped else '(none)'}")
+    def drop_columns():
+        with psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None) as conn:
+            dropped = drop_target_columns(conn)
+            conn.commit()
+            return dropped
+
+    dropped = run_with_retry("drop_target_columns", args.retries, args.retry_delay_seconds, drop_columns)
+    print(f"Dropped columns: {', '.join(dropped) if dropped else '(none)'}")
 
     return 0
 
